@@ -680,26 +680,3 @@ if __name__ == "__main__":
     # print(result["safety_summary_df"])
     # print(result["business_summary_df"])
     pass
-
-    ProductDecisionConfig(
-        min_ate=0.0,
-        min_qini=0.0,
-        min_auuc=0.0,
-        min_top_uplift_lift=0.0,
-        max_negative_uplift_ratio=0.5,
-        min_recommendable_customers=100,
-        min_support_samples=200,
-        top_ratio=0.2,
-    )
-
-    CustomerDecisionConfig(
-        min_cate=0.0,
-        top_k_per_customer=3,
-        customer_weight_col=None,
-    )
-
-    SafetyConfig(
-        max_customer_negative_share=0.5,
-        min_customer_expected_gain=0.0,
-    )
-
