@@ -3,6 +3,77 @@ Q:
 A:
 你提出的这个项目需求非常经典且具有很高的业务价值，它精准地抓住了对公业务从“粗放式管理”向“精细化运营”转型的核心。下面，我将结合你的思路，对项目进行系统性的分析，并提供一套可行的实施框架。
 
+---
+
+# 组合因果挖掘（Bundle Mining）补充
+
+当单产品因果模型（CATE/uplift）评估完成后，下一步可以做“产品组合（bundle）”的因果关系挖掘，用于回答：
+
+- **哪些产品组合同时达标（AND）时，能带来更高的存款提升？**
+- **组合是否存在协同/互斥（synergy/overlap）？**
+- **组合策略怎么推荐（先Base再Booster），怎么离线回测？**
+
+本仓库新增 `bundle_mining_pipeline.py`，用于在你现有 `backtest_full_pipeline.py` 基础上快速落地组合挖掘流程。
+
+## 1. 输入数据（沿用现有 long-format）
+
+至少需要：
+
+- `cust_id`
+- `product_id`
+- `date`
+- `T`：达标与否（0/1）
+- `Y`：t~t+30 存款差值
+- `cate`：单产品模型推理输出（可选；用于 overlap 计算，以及 demo 合成 bundle cate）
+
+## 2. 组合 treated 定义（当前默认 AND）
+
+对组合 `bundle={A,B}`：
+
+- `T_bundle = 1` 当且仅当 `T_A=1 且 T_B=1`
+- `Y` 在同一 `(cust_id,date)` 下按 mean 聚合，并输出 `Y_std` 用于检查输入一致性
+
+> 生产建议：bundle 的 `cate` 应该用独立 bundle 模型训练/推理得到。
+> Demo 为了先跑通流程，提供 `synthesize_bundle_cate(mode='min')` 临时合成（仅调试用）。
+
+## 3. 组合候选生成（模板化，避免 2^34 爆炸）
+
+基于单产品 `product_eval_df` 的决策结果：
+
+- Base 池：`recommend_all` 的 TopN（按 `product_score`）
+- Booster 池：`recommend_targeted` 的 TopN（按 `product_score`）
+
+默认生成：
+- Base + Booster
+- Base + Base
+
+可通过 `BundleMiningConfig(top_n_base, top_n_booster, max_bundle_size, min_bundle_support_rows)` 控制规模与样本门槛。
+
+## 4. 组合专属指标
+
+在 bundle 的产品层评估表上附加：
+
+- `synergy_score = ATE(bundle) - Σ ATE(product_i)`
+- `overlap_ratio_top`：Top uplift 客群重叠率（高说明冗余，低说明互补）
+- `incremental_to_base = ATE(bundle) - ATE(base)`（仅 Base+Booster 组合）
+
+## 5. 快速跑 demo
+
+```bash
+python bundle_mining_pipeline.py
+```
+
+会在模拟数据上输出：
+
+- `bundle_candidates` shape
+- `bundle_product_eval` shape
+- `bundle_product_eval_df` 的前几行（含 ate / synergy / overlap）
+
+若要把它接到真实数据，请将你的单产品 eval_df（含 cate/T/Y）读入，然后：
+
+- 先用 `backtest_full_pipeline.evaluate_products(eval_df)` 得到 `product_eval_df`
+- 再调用 `bundle_mining_pipeline.run_bundle_mining_backtest(eval_df, product_eval_df, ...)`
+
 📊 项目核心环节概览
 
 首先，我们用下面这个表格来快速把握整个项目的核心环节与关键点。
