@@ -186,48 +186,135 @@ def _as_category(values: np.ndarray, ordered: bool = False) -> pd.Categorical:
     return pd.Categorical(values, ordered=ordered)
 
 
-def simulate_evaldf(
-    cfg: Optional[EvalDFSimConfig] = None,
-) -> "pd.DataFrame | 'typing.Iterator[pd.DataFrame]'":
-    """
-    构造一份可用于 run_backtest 的 eval_df。
+# def simulate_evaldf(
+#     cfg: Optional[EvalDFSimConfig] = None,
+# ) -> "pd.DataFrame | 'typing.Iterator[pd.DataFrame]'":
+#     """
+#     构造一份可用于 run_backtest 的 eval_df。
 
-    字段：
-    - cust_id, product_id, date, cate, T, Y
-    并额外生成（可选用于 OPE 调试）：
-    - ps, mu1, mu0
+#     字段：
+#     - cust_id, product_id, date, cate, T, Y
+#     并额外生成（可选用于 OPE 调试）：
+#     - ps, mu1, mu0
 
-    生成逻辑（可解释 & 可控）：
-    - cate：N(cate_mean, cate_std)
-    - ps：sigmoid( a + b*cate + noise )，再 clip 到 (0.01,0.99)
-    - T：Bernoulli(ps)
-    - 真实增量 tau：true_tau_scale * tanh(cate)
-    - mu0：y_base + noise0
-    - mu1：mu0 + tau
-    - Y：mu0 + T*tau + eps
-    """
+#     生成逻辑（可解释 & 可控）：
+#     - cate：N(cate_mean, cate_std)
+#     - ps：sigmoid( a + b*cate + noise )，再 clip 到 (0.01,0.99)
+#     - T：Bernoulli(ps)
+#     - 真实增量 tau：true_tau_scale * tanh(cate)
+#     - mu0：y_base + noise0
+#     - mu1：mu0 + tau
+#     - Y：mu0 + T*tau + eps
+#     """
+#     import math
+#     from typing import Iterator
+
+#     cfg = cfg or EvalDFSimConfig()
+#     rng = np.random.default_rng(cfg.random_state)
+
+#     # 构造维度
+#     cust = np.arange(cfg.n_customers, dtype=np.int32)
+#     prod = np.arange(cfg.n_products, dtype=np.int16 if cfg.n_products < 32768 else np.int32)
+#     dates = pd.date_range(cfg.start_date, periods=cfg.n_dates, freq=cfg.freq)
+
+#     total_rows = int(cfg.n_customers) * int(cfg.n_products) * int(cfg.n_dates)
+
+#     # dtype 选择
+#     f_dtype = np.float32 if cfg.use_float32 else np.float64
+
+#     def _build_chunk(start: int, size: int) -> pd.DataFrame:
+#         # 把 [0,total_rows) 映射回 (date, product, customer)
+#         idx = np.arange(start, start + size, dtype=np.int64)
+
+#         # 展开顺序：date-major -> product -> customer
+#         # customer 索引最快变动
+#         cust_idx = (idx % cfg.n_customers).astype(np.int32)
+#         tmp = idx // cfg.n_customers
+#         prod_idx = (tmp % cfg.n_products).astype(prod.dtype)
+#         date_idx = (tmp // cfg.n_products).astype(np.int32)
+
+#         cust_id = cust[cust_idx]
+#         product_id = prod[prod_idx]
+#         date_vals = dates.values[date_idx]
+
+#         cate = rng.normal(cfg.cate_mean, cfg.cate_std, size=size).astype(f_dtype)
+
+#         # propensity score：让 cate 与 ps 有一定相关性（便于 OPE 调试）
+#         # 先做一个线性项，再 sigmoid
+#         z = (math.log(cfg.base_treated_rate / (1 - cfg.base_treated_rate)) + 0.8 * cate).astype(f_dtype)
+#         z = z + rng.normal(0.0, cfg.ps_noise, size=size).astype(f_dtype)
+#         ps = (1.0 / (1.0 + np.exp(-z))).astype(f_dtype)
+#         ps = np.clip(ps, 0.01, 0.99)
+
+#         T = rng.binomial(1, ps).astype(np.int8)
+
+#         tau = (cfg.true_tau_scale * np.tanh(cate)).astype(f_dtype)
+
+#         mu0 = (cfg.y_base + rng.normal(0.0, cfg.y_noise_std, size=size)).astype(f_dtype)
+#         mu1 = (mu0 + tau).astype(f_dtype)
+#         Y = (mu0 + T.astype(f_dtype) * tau + rng.normal(0.0, cfg.y_noise_std, size=size)).astype(f_dtype)
+
+#         df = pd.DataFrame(
+#             {
+#                 "cust_id": cust_id,
+#                 "product_id": product_id,
+#                 "date": date_vals,
+#                 "cate": cate,
+#                 "T": T,
+#                 "Y": Y,
+#                 "ps": ps,
+#                 "mu0": mu0,
+#                 "mu1": mu1,
+#             }
+#         )
+
+#         # 内存优化：category
+#         if cfg.use_category:
+#             df["cust_id"] = _as_category(df["cust_id"].to_numpy())
+#             df["product_id"] = _as_category(df["product_id"].to_numpy())
+#             df["date"] = _as_category(df["date"].to_numpy(), ordered=True)
+
+#         return df
+
+#     if cfg.chunk_rows and cfg.chunk_rows > 0:
+#         def _iter() -> Iterator[pd.DataFrame]:
+#             for start in range(0, total_rows, int(cfg.chunk_rows)):
+#                 size = min(int(cfg.chunk_rows), total_rows - start)
+#                 yield _build_chunk(start, size)
+#         return _iter()
+
+#     return _build_chunk(0, total_rows)
+def simulate_evaldf(cfg: Optional[EvalDFSimConfig] = None):
     import math
     from typing import Iterator
 
     cfg = cfg or EvalDFSimConfig()
     rng = np.random.default_rng(cfg.random_state)
 
-    # 构造维度
     cust = np.arange(cfg.n_customers, dtype=np.int32)
     prod = np.arange(cfg.n_products, dtype=np.int16 if cfg.n_products < 32768 else np.int32)
     dates = pd.date_range(cfg.start_date, periods=cfg.n_dates, freq=cfg.freq)
 
     total_rows = int(cfg.n_customers) * int(cfg.n_products) * int(cfg.n_dates)
-
-    # dtype 选择
     f_dtype = np.float32 if cfg.use_float32 else np.float64
 
+    # ================================
+    # 🆕 客户异质性（真实业务关键）
+    # ================================
+    cust_sensitivity = rng.normal(0, 1, cfg.n_customers).astype(f_dtype)
+
+    # ================================
+    # 🆕 产品效果分层（真实业务关键）
+    # ================================
+    prod_quality = rng.choice(
+        [2.0, 0.8, -0.5],   # 强 / 中 / 弱
+        size=cfg.n_products,
+        p=[0.2, 0.5, 0.3]
+    ).astype(f_dtype)
+
     def _build_chunk(start: int, size: int) -> pd.DataFrame:
-        # 把 [0,total_rows) 映射回 (date, product, customer)
         idx = np.arange(start, start + size, dtype=np.int64)
 
-        # 展开顺序：date-major -> product -> customer
-        # customer 索引最快变动
         cust_idx = (idx % cfg.n_customers).astype(np.int32)
         tmp = idx // cfg.n_customers
         prod_idx = (tmp % cfg.n_products).astype(prod.dtype)
@@ -237,17 +324,36 @@ def simulate_evaldf(
         product_id = prod[prod_idx]
         date_vals = dates.values[date_idx]
 
-        cate = rng.normal(cfg.cate_mean, cfg.cate_std, size=size).astype(f_dtype)
+        # ================================
+        # 🆕 真实个体uplift结构
+        # ================================
+        sensitivity = cust_sensitivity[cust_idx]
+        base_effect = prod_quality[prod_idx]
 
-        # propensity score：让 cate 与 ps 有一定相关性（便于 OPE 调试）
-        # 先做一个线性项，再 sigmoid
-        z = (math.log(cfg.base_treated_rate / (1 - cfg.base_treated_rate)) + 0.8 * cate).astype(f_dtype)
-        z = z + rng.normal(0.0, cfg.ps_noise, size=size).astype(f_dtype)
-        ps = (1.0 / (1.0 + np.exp(-z))).astype(f_dtype)
+        # 核心：产品强度 × 客户敏感度
+        cate = (
+            base_effect * (1 + 0.7 * sensitivity)
+            + rng.normal(0, 0.5, size)
+        ).astype(f_dtype)
+
+        cate = np.clip(cate, -3, 5)
+
+        # ================================
+        # 🆕 更真实的投放机制
+        # ================================
+        logits = (
+            math.log(cfg.base_treated_rate / (1 - cfg.base_treated_rate))
+            + 0.6 * sensitivity
+            + 0.3 * rng.normal(0, 1, size)
+        ).astype(f_dtype)
+
+        ps = (1.0 / (1.0 + np.exp(-logits))).astype(f_dtype)
         ps = np.clip(ps, 0.01, 0.99)
-
         T = rng.binomial(1, ps).astype(np.int8)
 
+        # ================================
+        # 潜在结果框架
+        # ================================
         tau = (cfg.true_tau_scale * np.tanh(cate)).astype(f_dtype)
 
         mu0 = (cfg.y_base + rng.normal(0.0, cfg.y_noise_std, size=size)).astype(f_dtype)
@@ -268,11 +374,10 @@ def simulate_evaldf(
             }
         )
 
-        # 内存优化：category
         if cfg.use_category:
-            df["cust_id"] = _as_category(df["cust_id"].to_numpy())
-            df["product_id"] = _as_category(df["product_id"].to_numpy())
-            df["date"] = _as_category(df["date"].to_numpy(), ordered=True)
+            df["cust_id"] = pd.Categorical(df["cust_id"])
+            df["product_id"] = pd.Categorical(df["product_id"])
+            df["date"] = pd.Categorical(df["date"], ordered=True)
 
         return df
 
@@ -284,6 +389,7 @@ def simulate_evaldf(
         return _iter()
 
     return _build_chunk(0, total_rows)
+
 
 
 def validate_eval_df(eval_df: pd.DataFrame) -> None:
