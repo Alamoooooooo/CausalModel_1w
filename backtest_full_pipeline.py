@@ -59,6 +59,13 @@ class ProductDecisionConfig:
     min_top_uplift_lift: float = 0.0
     min_empirical_uplift: float = 0.0
     max_negative_uplift_ratio: float = 0.50
+
+    # targeted 推荐：允许 ATE<0 但 Top 人群 uplift 命中能力强的产品进入推荐池（仅对高 uplift 人群推荐）
+    enable_targeted_reco: bool = True
+    targeted_top_ratio: float = 0.20          # 仅对每个产品 top20% 人群开放推荐
+    min_targeted_top_cate: float = 0.5        # Top 人群 cate 均值门槛（越高越“精准命中”）
+    min_targeted_lift: float = 0.0            # top_uplift_lift 门槛（Top 均值 - overall 均值）
+    allow_targeted_when_ate_negative: bool = True
     min_recommendable_customers: int = 100  # 本脚本暂未做强门禁，但可用于扩展
     min_support_samples: int = 300
     top_ratio: float = 0.20
@@ -304,13 +311,44 @@ def simulate_evaldf(cfg: Optional[EvalDFSimConfig] = None):
     cust_sensitivity = rng.normal(0, 1, cfg.n_customers).astype(f_dtype)
 
     # ================================
-    # 🆕 产品效果分层（真实业务关键）
+    # 🆕 产品画像（用于测试标签/推荐逻辑）
     # ================================
-    prod_quality = rng.choice(
-        [2.0, 0.8, -0.5],   # 强 / 中 / 弱
+    # 4类：
+    # - 全民收益型：整体正向、较稳定
+    # - 精准收割型：整体略负，但对高敏感客户显著正（适合 recommend_targeted）
+    # - 高风险波动型：高方差 + 负向占比高（误推风险）
+    # - 噪声型：近0均值、噪声主导
+    prod_type = rng.choice(
+        ["全民收益型", "精准收割型", "高风险波动型", "噪声型"],
         size=cfg.n_products,
-        p=[0.2, 0.5, 0.3]
-    ).astype(f_dtype)
+        p=[0.25, 0.25, 0.25, 0.25],
+    )
+
+    # 每类产品的基础参数（用于生成 cate）
+    # base_effect：整体均值方向；noise_sigma：产品内噪声；sensitivity_k：对客户敏感度的放大系数
+    base_effect_map = {
+        "全民收益型": 1.2,
+        "精准收割型": -0.3,
+        "高风险波动型": -0.2,
+        "噪声型": 0.0,
+    }
+    noise_sigma_map = {
+        "全民收益型": 0.35,
+        "精准收割型": 0.50,
+        "高风险波动型": 1.50,
+        "噪声型": 1.00,
+    }
+    sensitivity_k_map = {
+        "全民收益型": 0.30,
+        "精准收割型": 1.60,   # 对高敏感客户更“精准命中”
+        "高风险波动型": 0.80,
+        "噪声型": 0.10,
+    }
+
+    # 预先把每个 product 映射到参数（向量化）
+    base_effect_by_prod = np.array([base_effect_map[t] for t in prod_type], dtype=f_dtype)
+    noise_sigma_by_prod = np.array([noise_sigma_map[t] for t in prod_type], dtype=f_dtype)
+    sensitivity_k_by_prod = np.array([sensitivity_k_map[t] for t in prod_type], dtype=f_dtype)
 
     def _build_chunk(start: int, size: int) -> pd.DataFrame:
         idx = np.arange(start, start + size, dtype=np.int64)
@@ -325,18 +363,27 @@ def simulate_evaldf(cfg: Optional[EvalDFSimConfig] = None):
         date_vals = dates.values[date_idx]
 
         # ================================
-        # 🆕 真实个体uplift结构
+        # 🆕 真实个体 uplift 结构（四类产品画像）
         # ================================
         sensitivity = cust_sensitivity[cust_idx]
-        base_effect = prod_quality[prod_idx]
 
-        # 核心：产品强度 × 客户敏感度
+        base_effect = base_effect_by_prod[prod_idx]
+        noise_sigma = noise_sigma_by_prod[prod_idx]
+        k = sensitivity_k_by_prod[prod_idx]
+
+        # 精准收割型：只在高敏感客户上显著为正；低敏感客户更可能为负/接近0
+        # 通过 sigmoid(sensitivity) 做“人群门槛”效果
+        gate = (1.0 / (1.0 + np.exp(-2.0 * sensitivity))).astype(f_dtype)  # (0,1)
+        targeted_boost = (prod_type[prod_idx] == "精准收割型").astype(f_dtype) * (2.0 * gate - 1.0)
+
         cate = (
-            base_effect * (1 + 0.7 * sensitivity)
-            + rng.normal(0, 0.5, size)
+            base_effect
+            + k * sensitivity
+            + 1.2 * targeted_boost
+            + rng.normal(0.0, 1.0, size).astype(f_dtype) * noise_sigma
         ).astype(f_dtype)
 
-        cate = np.clip(cate, -3, 5)
+        cate = np.clip(cate, -6, 6)
 
         # ================================
         # 🆕 更真实的投放机制
@@ -371,6 +418,8 @@ def simulate_evaldf(cfg: Optional[EvalDFSimConfig] = None):
                 "ps": ps,
                 "mu0": mu0,
                 "mu1": mu1,
+                # 方便你做“模拟真值对照”的调试字段（不影响 REQUIRED_COLUMNS）
+                "product_type_true": np.array(prod_type, dtype=object)[prod_idx],
             }
         )
 
@@ -418,17 +467,22 @@ def _normalize_score(series: pd.Series) -> pd.Series:
 def compute_ate_by_product(eval_df: pd.DataFrame) -> pd.DataFrame:
     """
     ATE 口径：对每个产品，取 cate 的均值作为 ATE 估计。
+    同时输出波动性与分布形态所需的基础统计（分位数）。
     """
+    g = eval_df.groupby("product_id", observed=False)
     out = (
-        eval_df.groupby("product_id", as_index=False)
-        .agg(
+        g.agg(
             sample_size=("cust_id", "count"),
             n_customer=("cust_id", "nunique"),
             ate=("cate", "mean"),
             cate_std=("cate", "std"),
+            cate_p05=("cate", lambda s: float(s.quantile(0.05))),
+            cate_p50=("cate", lambda s: float(s.quantile(0.50))),
+            cate_p95=("cate", lambda s: float(s.quantile(0.95))),
             treated_rate=("T", "mean"),
             outcome_rate=("Y", "mean"),
         )
+        .reset_index()
     )
     out["cate_std"] = out["cate_std"].fillna(0.0)
     return out
@@ -440,7 +494,7 @@ def compute_empirical_uplift_by_product(eval_df: pd.DataFrame) -> pd.DataFrame:
     empirical_uplift = E[Y|T=1] - E[Y|T=0]
     """
     frames: List[Dict] = []
-    for product_id, g in eval_df.groupby("product_id"):
+    for product_id, g in eval_df.groupby("product_id", observed=False):
         treated = g[g["T"] == 1]
         control = g[g["T"] == 0]
 
@@ -488,7 +542,7 @@ def compute_top_segment_metrics(eval_df: pd.DataFrame, top_ratio: float) -> pd.D
     - top_vs_rest_gap = Top均值 - Rest均值
     """
     frames: List[Dict] = []
-    for product_id, g in eval_df.groupby("product_id"):
+    for product_id, g in eval_df.groupby("product_id", observed=False):
         g = g.sort_values("cate", ascending=False)
         n = len(g)
         top_n = max(1, int(np.ceil(n * top_ratio)))
@@ -517,7 +571,7 @@ def compute_negative_uplift_metrics(eval_df: pd.DataFrame) -> pd.DataFrame:
     - treated_negative_uplift_ratio：历史被触达/达标人群中 cate<0 的比例（仅作参考）
     """
     frames: List[Dict] = []
-    for product_id, g in eval_df.groupby("product_id"):
+    for product_id, g in eval_df.groupby("product_id", observed=False):
         neg_mask = g["cate"] < 0
         treated_mask = g["T"] == 1
 
@@ -543,7 +597,7 @@ def compute_qini_auuc_proxy(eval_df: pd.DataFrame) -> pd.DataFrame:
     注意：这里用 cate 的累计和构造 proxy，只保证流程一致性，不等价于严格定义的 Qini/AUUC。
     """
     frames: List[Dict] = []
-    for product_id, g in eval_df.groupby("product_id"):
+    for product_id, g in eval_df.groupby("product_id", observed=False):
         g = g.sort_values("cate", ascending=False)
         n = len(g)
         if n == 0:
@@ -561,6 +615,76 @@ def compute_qini_auuc_proxy(eval_df: pd.DataFrame) -> pd.DataFrame:
 # ============================================================
 # 产品层评估 + 门禁
 # ============================================================
+
+def _infer_distribution_shape(row: pd.Series) -> str:
+    """
+    附加字段：基于产品内 cate 分位数粗略判断分布形态，用于解释/排查。
+    """
+    try:
+        p05 = float(row.get("cate_p05", np.nan))
+        p50 = float(row.get("cate_p50", np.nan))
+        p95 = float(row.get("cate_p95", np.nan))
+        std = float(row.get("cate_std", np.nan))
+    except Exception:
+        return "unknown"
+
+    if not np.isfinite(std) or std <= 1e-12:
+        return "degenerate"
+
+    right_tail = (p95 - p50)
+    left_tail = (p50 - p05)
+
+    if np.isfinite(right_tail) and np.isfinite(left_tail):
+        if right_tail > 2.0 * max(left_tail, 1e-12):
+            return "right_skew_long_tail"
+        if left_tail > 2.0 * max(right_tail, 1e-12):
+            return "left_skew_long_tail"
+
+    if (p95 - p05) > 4.0 * std and abs(p50) < 0.1 * std:
+        return "polarized"
+
+    if np.isfinite(p95) and np.isfinite(p05) and (p95 - p05) < 1.5 * std:
+        return "noisy_symmetric"
+
+    return "normal"
+
+
+def _infer_product_tag(row: pd.Series) -> str:
+    """
+    主标签：产品层可解释分类（4 类）
+    - 全民收益型：ATE 明显为正，且负 uplift 比例低
+    - 精准收割型：ATE 不高/甚至偏负，但 top lift / top_vs_rest_gap 很强（适合 recommend_targeted）
+    - 高风险波动型：波动很大（std 高 / p95-p05 大）且负 uplift 比例高
+    - 噪声型：ATE 接近 0，top lift 也不明显，整体像噪声
+    """
+    ate = float(row.get("ate", 0.0))
+    neg = float(row.get("negative_uplift_ratio", 1.0))
+    std = float(row.get("cate_std", 0.0))
+    lift = float(row.get("top_uplift_lift", 0.0))
+    gap = float(row.get("top_vs_rest_gap", 0.0))
+    p05 = float(row.get("cate_p05", np.nan))
+    p95 = float(row.get("cate_p95", np.nan))
+
+    spread = (p95 - p05) if (np.isfinite(p95) and np.isfinite(p05)) else (4.0 * std)
+
+    if ate >= 0.3 and neg <= 0.30:
+        return "全民收益型"
+
+    if (ate <= 0.2) and (gap >= 0.8 or lift >= 0.5) and neg <= 0.55:
+        return "精准收割型"
+
+    if (spread >= 4.0 or std >= 1.2) and neg >= 0.55:
+        return "高风险波动型"
+
+    if abs(ate) < 0.1 and (gap < 0.3) and (lift < 0.2):
+        return "噪声型"
+
+    if ate > 0:
+        return "全民收益型"
+    if neg > 0.6:
+        return "高风险波动型"
+    return "噪声型"
+
 
 def evaluate_products(
     eval_df: pd.DataFrame,
@@ -611,10 +735,16 @@ def evaluate_products(
     product_eval["pass_top_lift"] = product_eval["top_uplift_lift"] > config.min_top_uplift_lift
     product_eval["pass_negative_risk"] = product_eval["negative_uplift_ratio"] <= config.max_negative_uplift_ratio
     product_eval["pass_support"] = product_eval["sample_size"] >= config.min_support_samples
+    # targeted 门禁：允许 ATE<0 的产品，只要它对 Top 人群“命中强”，且整体风险可控
+    # 注意：这里的 Top 人群口径沿用 compute_top_segment_metrics(top_ratio)
     product_eval["pass_targeted"] = (
-        (product_eval["top_uplift_lift"] > config.min_top_uplift_lift)
-        & (product_eval["negative_uplift_ratio"] <= config.max_negative_uplift_ratio)
+        (config.enable_targeted_reco)
+        & (
+            (product_eval["ate"] < 0) if config.allow_targeted_when_ate_negative else True
         )
+        & (product_eval["top_uplift_lift"] >= config.min_targeted_lift)
+        & (product_eval["negative_uplift_ratio"] <= config.max_negative_uplift_ratio)
+    )
     
     gate_cols = [
         "pass_ate",
@@ -639,22 +769,12 @@ def evaluate_products(
         product_eval["pass_ate"],                                   # 平均有效
     ],
     [
-        "recommend",        # 全量推荐
+        "recommend_all",        # 全量推荐
         "recommend_targeted",   # 仅高uplift人群
         "watchlist",            # 继续观察
     ],
     default="reject"
 )
-
-    # # 综合打分（用于产品排序/展示）
-    # product_eval["product_score"] = (
-    #     0.25 * _normalize_score(product_eval["ate"])
-    #     + 0.20 * _normalize_score(product_eval["empirical_uplift"])
-    #     + 0.15 * _normalize_score(product_eval["qini"])
-    #     + 0.15 * _normalize_score(product_eval["auuc"])
-    #     + 0.15 * _normalize_score(product_eval["top_uplift_lift"])
-    #     + 0.10 * (1 - _normalize_score(product_eval["negative_uplift_ratio"]))
-    # )
 
     score_mass = (
         0.30 * _normalize_score(product_eval["ate"])
@@ -680,6 +800,12 @@ def evaluate_products(
         score_mass
     )
 
+    # =========================
+    # 🆕 产品标签（主标签 + 分布形态）
+    # =========================
+    product_eval["distribution_shape"] = product_eval.apply(_infer_distribution_shape, axis=1)
+    product_eval["product_tag"] = product_eval.apply(_infer_product_tag, axis=1)
+
     return product_eval.sort_values(["recommendation_decision", "product_score"], ascending=[True, False])
 
 
@@ -692,6 +818,7 @@ def generate_recommendations(
     product_eval_df: pd.DataFrame,
     customer_config: Optional[CustomerDecisionConfig] = None,
     safety_config: Optional[SafetyConfig] = None,
+    product_config: Optional[ProductDecisionConfig] = None,
 ) -> pd.DataFrame:
     """
     生成客户-产品推荐对：
@@ -706,6 +833,7 @@ def generate_recommendations(
     validate_eval_df(eval_df)
     customer_config = customer_config or CustomerDecisionConfig()
     safety_config = safety_config or SafetyConfig()
+    product_config = product_config or ProductDecisionConfig()
 
     candidate_df = eval_df.merge(
         product_eval_df[
@@ -722,15 +850,37 @@ def generate_recommendations(
         how="left",
     )
 
-    # 产品门禁：仅进入推荐池的产品
+    # 产品门禁：进入推荐池的产品（全量 recommend_all + targeted recommend_targeted）
     if safety_config.enable_product_blacklist_gate:
-        candidate_df = candidate_df[candidate_df["recommendation_decision"] == "recommend"].copy()
+        candidate_df = candidate_df[
+            candidate_df["recommendation_decision"].isin(["recommend_all", "recommend_targeted"])
+        ].copy()
 
     # 校准后的增量
     candidate_df["adjusted_cate"] = candidate_df["cate"] * candidate_df["calibration_factor"].fillna(1.0)
 
     # 客户-产品门禁
     candidate_df = candidate_df[candidate_df["adjusted_cate"] > customer_config.min_cate].copy()
+
+    # targeted 产品：只对该产品 Top 人群开放推荐（避免“ATE<0 但全量推”带来的负向风险）
+    # 性能优化点：只对 recommend_targeted 子集做 groupby.rank/transform（否则 2千万级会非常慢）
+    if product_config.enable_targeted_reco and "recommendation_decision" in candidate_df.columns:
+        is_targeted = candidate_df["recommendation_decision"] == "recommend_targeted"
+        if bool(is_targeted.any()):
+            targeted_df = candidate_df[is_targeted].copy()
+
+            targeted_df["rank_in_product"] = targeted_df.groupby("product_id")["adjusted_cate"].rank(
+                method="first", ascending=False
+            )
+            targeted_df["n_in_product"] = targeted_df.groupby("product_id")["adjusted_cate"].transform("size")
+            targeted_df["is_top_in_product"] = targeted_df["rank_in_product"] <= (
+                np.ceil(targeted_df["n_in_product"] * float(product_config.targeted_top_ratio)).astype(int)
+            )
+
+            # 对 targeted：必须 top；对 recommend_all：不限制
+            targeted_df = targeted_df[targeted_df["is_top_in_product"]].copy()
+            candidate_df = pd.concat([candidate_df[~is_targeted], targeted_df], axis=0, ignore_index=True)
+        # 若没有 targeted 产品，直接跳过
 
     # 推荐得分：以 adjusted_cate 为主 + 产品综合分 + 风险惩罚
     candidate_df["recommend_score"] = (
@@ -852,25 +1002,39 @@ def temporal_stability(eval_df: pd.DataFrame) -> pd.DataFrame:
     输出每个 date 的：
     - model_ate: mean(cate)
     - empirical_uplift: mean(Y|T=1)-mean(Y|T=0)
+
+    性能/兼容性说明：
+    - 避免 groupby.apply（pandas 新版本会有 DeprecationWarning，且 apply 往往更慢）
+    - 使用 groupby 聚合（sum/count）后再计算差分
     """
     if eval_df.empty:
         return pd.DataFrame(columns=["date", "model_ate", "empirical_uplift", "treated_n", "control_n"])
 
-    def _emp_uplift(g: pd.DataFrame) -> pd.Series:
-        treated = g[g["T"] == 1]
-        control = g[g["T"] == 0]
-        return pd.Series(
-            {
-                "empirical_uplift": treated["Y"].mean() - control["Y"].mean(),
-                "treated_n": len(treated),
-                "control_n": len(control),
-            }
-        )
+    g = eval_df.groupby("date", observed=False)
 
-    model_ate = eval_df.groupby("date")["cate"].mean().reset_index(name="model_ate")
-    emp = eval_df.groupby("date").apply(_emp_uplift).reset_index()
+    # model ate
+    model_ate = g["cate"].mean().rename("model_ate")
 
-    return model_ate.merge(emp, on="date", how="left").sort_values("date")
+    # treated/control sums & counts
+    treated_sum = eval_df["Y"].where(eval_df["T"] == 1).groupby(eval_df["date"], observed=False).sum()
+    treated_n = eval_df["T"].groupby(eval_df["date"], observed=False).sum().astype(float)
+
+    control_sum = eval_df["Y"].where(eval_df["T"] == 0).groupby(eval_df["date"], observed=False).sum()
+    control_n = (1 - eval_df["T"]).groupby(eval_df["date"], observed=False).sum().astype(float)
+
+    treated_mean = treated_sum / treated_n.replace(0.0, np.nan)
+    control_mean = control_sum / control_n.replace(0.0, np.nan)
+
+    out = pd.DataFrame(
+        {
+            "date": model_ate.index,
+            "model_ate": model_ate.values,
+            "empirical_uplift": (treated_mean - control_mean).fillna(0.0).values,
+            "treated_n": treated_n.fillna(0.0).values,
+            "control_n": control_n.fillna(0.0).values,
+        }
+    )
+    return out.sort_values("date")
 
 
 # ============================================================
@@ -999,6 +1163,7 @@ def run_backtest(
         product_eval_df=product_eval_df,
         customer_config=customer_config,
         safety_config=safety_config,
+        product_config=product_config,
     )
 
     # 3) 推荐子集上的经验 uplift
@@ -1176,7 +1341,9 @@ def _recommendation_diagnosis_text(
 
     product_config = product_config or ProductDecisionConfig()
 
-    n_reco = int((product_eval_df.get("recommendation_decision") == "recommend").sum())
+    n_reco = int(
+        product_eval_df.get("recommendation_decision").isin(["recommend_all", "recommend_targeted"]).sum()
+    )
     if n_reco > 0:
         return ""
 
@@ -1188,7 +1355,7 @@ def _recommendation_diagnosis_text(
         neg_mean, neg_q50 = np.nan, np.nan
 
     msg = []
-    msg.append("### 诊断：为什么本次没有任何产品进入 recommend？")
+    msg.append("### 诊断：为什么本次没有任何产品进入 recommend_all / recommend_targeted？")
     msg.append("")
     msg.append(
         "本 pipeline 的产品层采用“多门禁同时满足才进入 recommend”的机制。"
@@ -1198,7 +1365,7 @@ def _recommendation_diagnosis_text(
     msg.append(
         f"- 当前配置 `max_negative_uplift_ratio={product_config.max_negative_uplift_ratio}`"
         f"，而本次数据 `negative_uplift_ratio` 中位数≈{_fmt(neg_q50, 4)}，均值≈{_fmt(neg_mean, 4)}"
-        "，因此大部分/全部产品会在 `pass_negative_risk` 上失败，最终导致 recommend=0。"
+        "，因此大部分/全部产品会在 `pass_negative_risk` 上失败，最终导致推荐池为空。"
     )
     msg.append("")
     msg.append("可选解决方案（用于让示例报告更像业务结果）：")
@@ -1240,7 +1407,15 @@ def render_business_report(
     n_rows = int(customer_reco_df.shape[0]) if not customer_reco_df.empty else 0
     n_customers = int(customer_reco_df["cust_id"].nunique()) if ("cust_id" in customer_reco_df.columns and not customer_reco_df.empty) else 0
     n_products = int(product_eval_df["product_id"].nunique()) if ("product_id" in product_eval_df.columns and not product_eval_df.empty) else 0
-    n_reco_products = int((product_eval_df.get("recommendation_decision") == "recommend").sum()) if not product_eval_df.empty else 0
+    # 推荐池产品数：包含 recommend_all + recommend_targeted
+    if not product_eval_df.empty:
+        n_reco_products = int(product_eval_df["recommendation_decision"].isin(["recommend_all", "recommend_targeted"]).sum())
+        n_reco_products_all = int((product_eval_df["recommendation_decision"] == "recommend_all").sum())
+        n_reco_products_targeted = int((product_eval_df["recommendation_decision"] == "recommend_targeted").sum())
+    else:
+        n_reco_products = 0
+        n_reco_products_all = 0
+        n_reco_products_targeted = 0
 
     reco_uplift = float(reco_empirical_eval_df["empirical_uplift"].iloc[0]) if not reco_empirical_eval_df.empty else np.nan
 
@@ -1248,6 +1423,8 @@ def render_business_report(
     if not product_eval_df.empty:
         cols = [
             "product_id",
+            "product_tag",
+            "distribution_shape",
             "recommendation_decision",
             "sample_size",
             "n_customer",
@@ -1256,7 +1433,12 @@ def render_business_report(
             "qini",
             "auuc",
             "top_uplift_lift",
+            "top_vs_rest_gap",
             "negative_uplift_ratio",
+            "cate_std",
+            "cate_p05",
+            "cate_p50",
+            "cate_p95",
             "product_score",
         ]
         cols = [c for c in cols if c in product_eval_df.columns]
@@ -1313,7 +1495,9 @@ def render_business_report(
         "\n".join(
             [
                 f"- 覆盖产品数：{_fmt(n_products, 0)}",
-                f"- 进入推荐池产品数（decision=recommend）：{_fmt(n_reco_products, 0)}",
+                f"- 进入推荐池产品数（recommend_all + recommend_targeted）：{_fmt(n_reco_products, 0)}",
+                f"  - recommend_all：{_fmt(n_reco_products_all, 0)}",
+                f"  - recommend_targeted：{_fmt(n_reco_products_targeted, 0)}",
                 f"- 推荐明细行数（customer-product pairs）：{_fmt(n_rows, 0)}",
                 f"- 被推荐客户数（unique cust_id）：{_fmt(n_customers, 0)}",
                 f"- 推荐子集经验 uplift（treated-control）：{_fmt(reco_uplift, 6)}",
@@ -1323,13 +1507,45 @@ def render_business_report(
     )
 
     md.append("## 二、产品层评估（Product Level）\n")
+    if not product_eval_df.empty and "product_tag" in product_eval_df.columns:
+        md.append("### 2.0.1 产品标签分布（主标签）\n")
+        tag_dist = (
+            product_eval_df["product_tag"]
+            .value_counts()
+            .rename_axis("product_tag")
+            .reset_index(name="n_products")
+        )
+        tag_dist["share"] = tag_dist["n_products"] / tag_dist["n_products"].sum()
+        md.append(_table(tag_dist) + "\n")
+
+        if "distribution_shape" in product_eval_df.columns:
+            md.append("### 2.0.2 分布形态分布（附加字段）\n")
+            shape_dist = (
+                product_eval_df["distribution_shape"]
+                .value_counts()
+                .rename_axis("distribution_shape")
+                .reset_index(name="n_products")
+            )
+            shape_dist["share"] = shape_dist["n_products"] / shape_dist["n_products"].sum()
+            md.append(_table(shape_dist) + "\n")
+
+        if "recommendation_decision" in product_eval_df.columns:
+            md.append("### 2.0.3 决策 × 标签 交叉（便于看 recommend_all/recommend_targeted 在哪类产品上发生）\n")
+            cross = (
+                product_eval_df
+                .groupby(["recommendation_decision", "product_tag"], observed=False)
+                .size()
+                .reset_index(name="n_products")
+            )
+            md.append(_table(cross) + "\n")
     md.append(
         "\n".join(
             [
                 "### 2.0 方法说明（产品门禁 / 决策含义）",
-                "- `recommend`：通过所有产品门禁（可进入推荐池）",
-                "- `watchlist`：仅满足部分门禁（例如 ATE 为正但风险或排序能力不足）",
-                "- `reject`：关键门禁未通过（整体方向/风险等不满足）",
+                "- `recommend_all`：全量推荐（通过全部门禁，适合大规模触达）",
+                "- `recommend_targeted`：定向推荐（允许 ATE<0，但对 Top uplift 人群命中强，仅对该产品 Top 人群开放推荐）",
+                "- `watchlist`：继续观察（部分指标可，但不足以上线）",
+                "- `reject`：不推荐（关键门禁未通过/风险过高）",
                 "",
                 "产品进入 recommend 需要同时满足的门禁包括：ATE、empirical uplift、qini/auuc proxy、top lift、negative uplift 风险、样本量等。",
                 "",
@@ -1352,7 +1568,7 @@ def render_business_report(
     md.append("### 2.1 门禁通过率与主要失败原因汇总\n")
     md.append(_table(gate_summary) + "\n")
     if isinstance(dec_summary, pd.DataFrame) and not dec_summary.empty:
-        md.append("### 2.2 产品决策分布（recommend/watchlist/reject）\n")
+        md.append("### 2.2 产品决策分布（recommend_all/recommend_targeted/watchlist/reject）\n")
         md.append(_table(dec_summary) + "\n")
 
     diag_txt = _recommendation_diagnosis_text(product_eval_df, product_config=None)
@@ -1585,6 +1801,23 @@ if __name__ == "__main__":
 
     # 4) 生成业务可读报告（Markdown）
     report_path = "backtest_output/backtest_report.md"
-    render_business_report(result, out_path=report_path, top_products=20, top_reco_rows=50)
+    md_text = render_business_report(result, out_path=report_path, top_products=20, top_reco_rows=50)
     print(f"report saved: {report_path}")
     print("note: also saved GBK version for Windows console:", "backtest_output/backtest_report_gbk.md")
+    # 关键调试输出：让你能立刻看到新决策/标签是否生效（避免误读旧报告缓存）
+    try:
+        p = result["product_eval_df"]["recommendation_decision"].value_counts()
+        print("decision_counts:", p.to_dict())
+        if "product_tag" in result["product_eval_df"].columns:
+            print("product_tag_counts:", result["product_eval_df"]["product_tag"].value_counts().to_dict())
+        if "distribution_shape" in result["product_eval_df"].columns:
+            print("distribution_shape_counts:", result["product_eval_df"]["distribution_shape"].value_counts().to_dict())
+        print("customer_reco_rows:", int(result["customer_reco_df"].shape[0]))
+    except Exception:
+        pass
+    # 可选：打印报告头部前 60 行（便于在终端快速确认内容更新）
+    try:
+        head_lines = "\n".join(md_text.splitlines()[:60])
+        print("\n==== report head (first 60 lines) ====\n" + head_lines + "\n==== end report head ====\n")
+    except Exception:
+        pass
