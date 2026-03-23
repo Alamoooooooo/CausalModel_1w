@@ -611,7 +611,11 @@ def evaluate_products(
     product_eval["pass_top_lift"] = product_eval["top_uplift_lift"] > config.min_top_uplift_lift
     product_eval["pass_negative_risk"] = product_eval["negative_uplift_ratio"] <= config.max_negative_uplift_ratio
     product_eval["pass_support"] = product_eval["sample_size"] >= config.min_support_samples
-
+    product_eval["pass_targeted"] = (
+        (product_eval["top_uplift_lift"] > config.min_top_uplift_lift)
+        & (product_eval["negative_uplift_ratio"] <= config.max_negative_uplift_ratio)
+        )
+    
     gate_cols = [
         "pass_ate",
         "pass_empirical",
@@ -623,20 +627,57 @@ def evaluate_products(
     ]
     product_eval["pass_rate"] = product_eval[gate_cols].mean(axis=1)
 
-    product_eval["recommendation_decision"] = np.where(
-        product_eval[gate_cols].all(axis=1),
-        "recommend",
-        np.where(product_eval["pass_ate"], "watchlist", "reject"),
-    )
+    # product_eval["recommendation_decision"] = np.where(
+    #     product_eval[gate_cols].all(axis=1),
+    #     "recommend",
+    #     np.where(product_eval["pass_ate"], "watchlist", "reject"),
+    # )
+    product_eval["recommendation_decision"] = np.select(
+    [
+        product_eval[gate_cols].all(axis=1),                        # 全指标通过
+        product_eval["pass_targeted"],                              # 定向有效
+        product_eval["pass_ate"],                                   # 平均有效
+    ],
+    [
+        "recommend",        # 全量推荐
+        "recommend_targeted",   # 仅高uplift人群
+        "watchlist",            # 继续观察
+    ],
+    default="reject"
+)
 
-    # 综合打分（用于产品排序/展示）
-    product_eval["product_score"] = (
-        0.25 * _normalize_score(product_eval["ate"])
-        + 0.20 * _normalize_score(product_eval["empirical_uplift"])
+    # # 综合打分（用于产品排序/展示）
+    # product_eval["product_score"] = (
+    #     0.25 * _normalize_score(product_eval["ate"])
+    #     + 0.20 * _normalize_score(product_eval["empirical_uplift"])
+    #     + 0.15 * _normalize_score(product_eval["qini"])
+    #     + 0.15 * _normalize_score(product_eval["auuc"])
+    #     + 0.15 * _normalize_score(product_eval["top_uplift_lift"])
+    #     + 0.10 * (1 - _normalize_score(product_eval["negative_uplift_ratio"]))
+    # )
+
+    score_mass = (
+        0.30 * _normalize_score(product_eval["ate"])
+        + 0.25 * _normalize_score(product_eval["empirical_uplift"])
         + 0.15 * _normalize_score(product_eval["qini"])
         + 0.15 * _normalize_score(product_eval["auuc"])
-        + 0.15 * _normalize_score(product_eval["top_uplift_lift"])
+        + 0.05 * _normalize_score(product_eval["top_uplift_lift"])
         + 0.10 * (1 - _normalize_score(product_eval["negative_uplift_ratio"]))
+    )
+
+    score_targeted = (
+        0.05 * _normalize_score(product_eval["ate"])
+        + 0.15 * _normalize_score(product_eval["empirical_uplift"])
+        + 0.25 * _normalize_score(product_eval["qini"])
+        + 0.25 * _normalize_score(product_eval["auuc"])
+        + 0.20 * _normalize_score(product_eval["top_uplift_lift"])
+        + 0.10 * (1 - _normalize_score(product_eval["negative_uplift_ratio"]))
+    )
+
+    product_eval["product_score"] = np.where(
+        product_eval["recommendation_decision"] == "recommend_targeted",
+        score_targeted,
+        score_mass
     )
 
     return product_eval.sort_values(["recommendation_decision", "product_score"], ascending=[True, False])
