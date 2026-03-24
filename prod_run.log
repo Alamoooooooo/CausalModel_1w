@@ -1,0 +1,68 @@
+Traceback (most recent call last):
+  File "D:\wuwenda\py3.12\Lib\site-packages\pandas\core\groupby\groupby.py", line 1942, in _agg_py_fallback
+    res_values = self._grouper.agg_series(ser, alt, preserve_dtype=True)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\wuwenda\py3.12\Lib\site-packages\pandas\core\groupby\ops.py", line 864, in agg_series
+    result = self._aggregate_series_pure_python(obj, func)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\wuwenda\py3.12\Lib\site-packages\pandas\core\groupby\ops.py", line 885, in _aggregate_series_pure_python
+    res = func(group)
+          ^^^^^^^^^^^
+  File "D:\wuwenda\py3.12\Lib\site-packages\pandas\core\groupby\groupby.py", line 2454, in <lambda>
+    alt=lambda x: Series(x, copy=False).mean(numeric_only=numeric_only),
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\wuwenda\py3.12\Lib\site-packages\pandas\core\series.py", line 6549, in mean
+    return NDFrame.mean(self, axis, skipna, numeric_only, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\wuwenda\py3.12\Lib\site-packages\pandas\core\generic.py", line 12420, in mean
+    return self._stat_function(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "D:\wuwenda\py3.12\Lib\site-packages\pandas\core\generic.py", line 12377, in _stat_function
+    return self._reduce(
+           ^^^^^^^^^^^^^
+  File "D:\wuwenda\py3.12\Lib\site-packages\pandas\core\series.py", line 6457, in _reduce
+    return op(delegate, skipna=skipna, **kwds)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\wuwenda\py3.12\Lib\site-packages\pandas\core\nanops.py", line 147, in f
+    result = alt(values, axis=axis, skipna=skipna, **kwds)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\wuwenda\py3.12\Lib\site-packages\pandas\core\nanops.py", line 404, in new_func
+    result = func(values, axis=axis, skipna=skipna, mask=mask, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\wuwenda\py3.12\Lib\site-packages\pandas\core\nanops.py", line 720, in nanmean
+    the_sum = _ensure_numeric(the_sum)
+              ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\wuwenda\py3.12\Lib\site-packages\pandas\core\nanops.py", line 1701, in _ensure_numeric
+    raise TypeError(f"Could not convert string '{x}' to numeric")
+TypeError: Could not convert string '\u566a\u58f0\u578b\u5168\u6c11\u6536\u76ca\u578b' to numeric
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "D:\wuwenda\AlamoWork\\u56e0\u679c\u6a21\u578b\CausalModel_1w\bundle_mining_pipeline.py", line 678, in <module>
+    result_debug = run_bundle_mining_backtest(
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\wuwenda\AlamoWork\\u56e0\u679c\u6a21\u578b\CausalModel_1w\bundle_mining_pipeline.py", line 558, in run_bundle_mining_backtest
+    bdf = build_bundle_eval_df_and_mode(
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\wuwenda\AlamoWork\\u56e0\u679c\u6a21\u578b\CausalModel_1w\bundle_mining_pipeline.py", line 281, in build_bundle_eval_df_and_mode
+    extra_agg = sub.groupby(gkey, observed=False)[extra_cols].mean().reset_index()
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\wuwenda\py3.12\Lib\site-packages\pandas\core\groupby\groupby.py", line 2452, in mean
+    result = self._cython_agg_general(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\wuwenda\py3.12\Lib\site-packages\pandas\core\groupby\groupby.py", line 1998, in _cython_agg_general
+    new_mgr = data.grouped_reduce(array_func)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\wuwenda\py3.12\Lib\site-packages\pandas\core\internals\managers.py", line 1469, in grouped_reduce
+    applied = sb.apply(func)
+              ^^^^^^^^^^^^^^
+  File "D:\wuwenda\py3.12\Lib\site-packages\pandas\core\internals\blocks.py", line 393, in apply
+    result = func(self.values, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\wuwenda\py3.12\Lib\site-packages\pandas\core\groupby\groupby.py", line 1995, in array_func
+    result = self._agg_py_fallback(how, values, ndim=data.ndim, alt=alt)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\wuwenda\py3.12\Lib\site-packages\pandas\core\groupby\groupby.py", line 1946, in _agg_py_fallback
+    raise type(err)(msg) from err
+TypeError: agg function failed [how->mean,dtype->object]

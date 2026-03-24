@@ -50,6 +50,14 @@ from backtest_full_pipeline import (  # noqa: F401
     validate_eval_df,
 )
 
+# 可选：生产训练依赖（causalml）
+# - debug 模式不需要 causalml
+# - prod 模式如果缺少 causalml，会在运行时抛出清晰错误
+try:
+    from causalml.inference.meta import BaseDRLearner  # type: ignore
+except Exception:  # pragma: no cover
+    BaseDRLearner = None  # type: ignore
+
 
 # =========================
 # 配置：组合候选生成
@@ -88,6 +96,61 @@ class BundleMiningConfig:
     top_ratio_for_overlap: float = 0.2
 
     random_state: int = 42
+
+
+@dataclass
+class BundleTrainConfig:
+    """
+    组合模型训练/推理配置（生产用）
+
+    mode:
+    - debug: 允许用单产品 cate 合成 bundle cate（仅用于流程调试）
+    - prod : 独立训练 bundle 的 DRLearner 并推理得到 cate_bundle
+
+    artifacts_dir:
+    - 存放每个 bundle 的模型与 cate 结果（parquet）
+      推荐结构：artifacts_dir/{bundle_id}/model.pkl + cate.parquet
+
+    特别说明（与你当前 repo 的现状对齐）：
+    - 生产训练需要 X 特征列；但当前 bundle_mining_pipeline.py 的输入 eval_df 只有 cust_id/product_id/date/T/Y/cate。
+      因此这里做成“feature_cols 可传入 + features_df 可选 merge”的形式：
+        - 若 eval_df 已包含 X 列：直接用
+        - 若 X 在独立 features_df（按 cust_id,date 或 cust_id,date,product_id 对齐）：由你在调用时传入并 merge
+
+    性能建议（千万级）：
+    - prefer_parquet: 使用 parquet 进行 cate 落盘，速度/体积更好
+    - float32: cate 用 float32
+    - chunk_rows: 仅用于推理阶段分块写出（pandas+sklearn/causalml 并不真正支持 out-of-core 训练）
+    """
+    mode: str = "debug"  # debug|prod
+    artifacts_dir: str = "bundle_artifacts"
+    force_retrain: bool = False
+
+    # 训练特征列（必须）
+    feature_cols: Optional[List[str]] = None
+
+    # 特征表 merge 方式（可选）
+    # - None: 不 merge，期望 eval_df 已含特征列
+    # - ["cust_id","date"]: 最常见
+    feature_merge_keys: Optional[List[str]] = None
+
+    # 生产：单产品训练数据读取
+    # 你的实际情况：每个产品一个文件，列为 [cust_id, date, X..., T, Y]
+    # 组合训练时需要把 bundle 内多个产品文件对齐到 cust_id-date 粒度，并构造 T_bundle/Y。
+    per_product_data_dir: str = "per_product_data"
+    per_product_file_pattern: str = "{product_id}.parquet"  # 也可以是 {product_id}.csv
+    per_product_file_format: str = "parquet"  # parquet|csv
+    # 读取时只保留必要列：keys + X + T + Y
+    t_col: str = "T"
+    y_col: str = "Y"
+
+    # 模型训练参数（给 DRLearner 的 outcome/treatment/model 等留接口）
+    # 这里先保留 dict，便于你接入你单产品训练时的配置
+    learner_params: Optional[Dict[str, object]] = None
+
+    prefer_parquet: bool = True
+    cate_float32: bool = True
+    chunk_rows: int = 2_000_000
 
 
 # =========================
@@ -289,6 +352,292 @@ def synthesize_bundle_cate(
 
 
 # =========================
+# 生产：bundle 独立训练 / 推理 / 落盘
+# =========================
+
+def _ensure_dir(path: str) -> None:
+    import os
+    os.makedirs(path, exist_ok=True)
+
+
+def _bundle_artifact_paths(train_cfg: BundleTrainConfig, bundle_id: str) -> Dict[str, str]:
+    import os
+    bdir = os.path.join(train_cfg.artifacts_dir, bundle_id)
+    _ensure_dir(bdir)
+    return {
+        "bundle_dir": bdir,
+        "model_path": os.path.join(bdir, "drlearner_model.pkl"),
+        "cate_path": os.path.join(bdir, "cate.parquet" if train_cfg.prefer_parquet else "cate.csv"),
+    }
+
+
+def _merge_features_if_needed(
+    bundle_eval_df: pd.DataFrame,
+    features_df: Optional[pd.DataFrame],
+    train_cfg: BundleTrainConfig,
+) -> pd.DataFrame:
+    """
+    旧接口保留：如果你已经在外部把特征整理成一个 features_df（cust_id-date 粒度），可用此 merge。
+    你的现状是“每个产品独立落盘一个文件”，生产推荐走 _build_bundle_train_df_from_per_product_files()。
+    """
+    if features_df is None:
+        return bundle_eval_df
+    if not train_cfg.feature_merge_keys:
+        raise ValueError("features_df provided but BundleTrainConfig.feature_merge_keys is None")
+    keys = train_cfg.feature_merge_keys
+    missing = [k for k in keys if k not in bundle_eval_df.columns]
+    if missing:
+        raise ValueError(f"bundle_eval_df missing merge keys: {missing}")
+    missing2 = [k for k in keys if k not in features_df.columns]
+    if missing2:
+        raise ValueError(f"features_df missing merge keys: {missing2}")
+    feat_cols = train_cfg.feature_cols
+    if not feat_cols:
+        raise ValueError("BundleTrainConfig.feature_cols must be set for prod mode")
+    keep_cols = list(dict.fromkeys(keys + feat_cols))
+    return bundle_eval_df.merge(features_df[keep_cols], on=keys, how="left")
+
+
+def _load_cached_bundle_cate(
+    cate_path: str,
+    bundle_eval_df: pd.DataFrame,
+    train_cfg: BundleTrainConfig,
+) -> Optional[pd.DataFrame]:
+    import os
+    if not os.path.exists(cate_path):
+        return None
+
+    gkey = ["cust_id", "date"]
+    if train_cfg.prefer_parquet and cate_path.endswith(".parquet"):
+        cached = pd.read_parquet(cate_path)
+    else:
+        cached = pd.read_csv(cate_path)
+
+    # 要求至少包含 cust_id/date/cate
+    for c in ["cust_id", "date", "cate"]:
+        if c not in cached.columns:
+            return None
+
+    out = bundle_eval_df.merge(cached[gkey + ["cate"]], on=gkey, how="left", suffixes=("", "_cached"))
+    # 若 bundle_eval_df 原本 cate 是 NaN，则直接覆盖；否则保留原值
+    out["cate"] = out["cate"].where(out["cate"].notna(), out["cate_cached"])
+    out.drop(columns=["cate_cached"], inplace=True, errors="ignore")
+    return out
+
+
+def _train_and_predict_drlearner(
+    train_df: pd.DataFrame,
+    feature_cols: List[str],
+    train_cfg: BundleTrainConfig,
+    model_path: Optional[str] = None,
+) -> np.ndarray:
+    """
+    训练 causalml DRLearner 并返回 cate 预测（按 train_df 行顺序）。
+    说明：
+    - 这里提供一个最小可运行实现：BaseDRLearner + sklearn 默认模型（若你已有单品训练的 base learner，请在 learner_params 里传入）
+    - 训练/预测均在内存内完成；千万级需要严格控制候选 bundle 数量 + 特征列数
+    """
+    if BaseDRLearner is None:
+        raise ImportError("prod mode requires causalml. Please install causalml to use DRLearner training.")
+
+    from sklearn.ensemble import RandomForestRegressor
+    from joblib import dump
+
+    params = train_cfg.learner_params or {}
+
+    # 默认基学习器（可按你单品训练替换）
+    # DRLearner 需要 outcome_model / treatment_model（或是 BaseDRLearner 的默认配置）
+    # causalml 的 BaseDRLearner 接口可能随版本不同，这里尽量用最常见形态：
+    # BaseDRLearner(learner=..., control_outcome_learner=..., treatment_outcome_learner=...)
+    base_learner = params.get(
+        "base_learner",
+        RandomForestRegressor(
+            n_estimators=int(params.get("n_estimators", 200)),
+            min_samples_leaf=int(params.get("min_samples_leaf", 50)),
+            max_depth=params.get("max_depth", None),
+            random_state=int(params.get("random_state", 42)),
+            n_jobs=int(params.get("n_jobs", -1)),
+        ),
+    )
+
+    X = train_df[feature_cols].to_numpy()
+    T = train_df["T"].to_numpy()
+    y = train_df["Y"].to_numpy()
+
+    learner = BaseDRLearner(learner=base_learner)
+    learner.fit(X=X, treatment=T, y=y)
+
+    cate = learner.predict(X=X)
+
+    # 落盘模型（可选）
+    if model_path:
+        try:
+            dump(learner, model_path)
+        except Exception:
+            # 模型落盘失败不影响 cate 生成
+            pass
+
+    return np.asarray(cate).reshape(-1)
+
+
+def _read_per_product_df(
+    product_id: str,
+    train_cfg: BundleTrainConfig,
+    usecols: Optional[List[str]] = None,
+) -> pd.DataFrame:
+    """
+    读取单产品训练数据文件：每个产品一个文件，粒度为 cust_id-date。
+    文件路径：{per_product_data_dir}/{per_product_file_pattern.format(product_id=...)}
+    """
+    import os
+
+    fname = train_cfg.per_product_file_pattern.format(product_id=str(product_id))
+    path = os.path.join(train_cfg.per_product_data_dir, fname)
+
+    if train_cfg.per_product_file_format == "parquet":
+        df = pd.read_parquet(path, columns=usecols)
+    elif train_cfg.per_product_file_format == "csv":
+        df = pd.read_csv(path, usecols=usecols)
+    else:
+        raise ValueError("per_product_file_format must be parquet or csv")
+
+    # 基础校验
+    for c in ["cust_id", "date", train_cfg.t_col, train_cfg.y_col]:
+        if c not in df.columns:
+            raise ValueError(f"per-product df for product={product_id} missing column: {c}")
+    return df
+
+
+def _build_bundle_train_df_from_per_product_files(
+    bundle: BundleCandidate,
+    train_cfg: BundleTrainConfig,
+) -> pd.DataFrame:
+    """
+    生产：从 bundle 内各单产品文件构造组合训练集（cust_id-date 粒度）
+
+    输入（每个产品文件）列为：
+    - cust_id, date, X..., T, Y
+
+    输出列为：
+    - cust_id, date, X..., T, Y
+    其中：
+    - T 为 T_bundle = AND(T_i)
+    - Y 为按 cust_id-date 聚合的 mean(Y_i)（通常应一致）
+    - X：默认直接取 bundle.base_product 的 X（因为不同产品的特征表通常相同；若你实际是“产品特征不同”，需要扩展为 concat/交叉特征）
+    """
+    if not train_cfg.feature_cols:
+        raise ValueError("prod mode requires BundleTrainConfig.feature_cols (X columns list)")
+
+    gkey = ["cust_id", "date"]
+    usecols = list(dict.fromkeys(gkey + train_cfg.feature_cols + [train_cfg.t_col, train_cfg.y_col]))
+
+    # 1) 先读取 base 产品作为特征来源（默认）
+    base_pid = bundle.base_product or bundle.products[0]
+    base_df = _read_per_product_df(product_id=str(base_pid), train_cfg=train_cfg, usecols=usecols).copy()
+    base_df.rename(columns={train_cfg.t_col: f"{train_cfg.t_col}__{base_pid}", train_cfg.y_col: f"{train_cfg.y_col}__{base_pid}"}, inplace=True)
+
+    merged = base_df
+
+    # 2) 依次 merge 其它产品的 T/Y（只 merge 两列，节省内存）
+    for pid in bundle.products:
+        pid = str(pid)
+        if pid == str(base_pid):
+            continue
+        df2 = _read_per_product_df(product_id=pid, train_cfg=train_cfg, usecols=gkey + [train_cfg.t_col, train_cfg.y_col]).copy()
+        df2.rename(columns={train_cfg.t_col: f"{train_cfg.t_col}__{pid}", train_cfg.y_col: f"{train_cfg.y_col}__{pid}"}, inplace=True)
+        merged = merged.merge(df2, on=gkey, how="inner")
+
+    # 3) 构造 T_bundle / Y
+    t_cols = [c for c in merged.columns if c.startswith(f"{train_cfg.t_col}__")]
+    y_cols = [c for c in merged.columns if c.startswith(f"{train_cfg.y_col}__")]
+
+    merged["T"] = merged[t_cols].min(axis=1).astype(np.int8)
+    merged["Y"] = merged[y_cols].mean(axis=1)
+
+    # 4) 列裁剪：保留 key + X + T + Y
+    out_cols = gkey + train_cfg.feature_cols + ["T", "Y"]
+    out = merged[out_cols].copy()
+
+    # 缺失处理
+    out[train_cfg.feature_cols] = out[train_cfg.feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    return out
+
+
+def ensure_bundle_cate(
+    eval_df: pd.DataFrame,
+    bundle_eval_df: pd.DataFrame,
+    bundle: BundleCandidate,
+    train_cfg: BundleTrainConfig,
+    features_df: Optional[pd.DataFrame] = None,
+    synthesize_cate_mode: str = "min",
+) -> pd.DataFrame:
+    """
+    给 bundle_eval_df 补齐 cate：
+
+    - debug：用 synthesize_bundle_cate() 合成（仅调试）
+    - prod ：读取缓存 cate；没有则训练 DRLearner -> 推理 -> 落盘 -> merge 回 bundle_eval_df
+
+    约束：
+    - prod 模式必须提供 train_cfg.feature_cols（以及必要时的 features_df+merge_keys），否则无法训练
+    """
+    if train_cfg.mode not in {"debug", "prod"}:
+        raise ValueError("BundleTrainConfig.mode must be one of: debug, prod")
+
+    if train_cfg.mode == "debug":
+        return synthesize_bundle_cate(eval_df=eval_df, bundle_eval_df=bundle_eval_df, bundle=bundle, mode=synthesize_cate_mode)
+
+    # prod
+    paths = _bundle_artifact_paths(train_cfg, bundle.bundle_id)
+    cached = None if train_cfg.force_retrain else _load_cached_bundle_cate(paths["cate_path"], bundle_eval_df, train_cfg)
+    if cached is not None:
+        return cached
+
+    # 训练数据准备（两种来源）：
+    # A) 推荐：从“每个产品独立落盘文件”构造组合训练集（你的真实生产形态）
+    # B) 兼容：外部传入 features_df，merge 到 bundle_eval_df（适用于你以后把特征做成统一表的情况）
+    if features_df is None:
+        train_df = _build_bundle_train_df_from_per_product_files(bundle=bundle, train_cfg=train_cfg)
+        feature_cols = list(train_cfg.feature_cols or [])
+    else:
+        df = bundle_eval_df.copy()
+        df = _merge_features_if_needed(df, features_df=features_df, train_cfg=train_cfg)
+
+        feature_cols = train_cfg.feature_cols
+        if not feature_cols:
+            raise ValueError("prod mode requires BundleTrainConfig.feature_cols")
+        missing = [c for c in feature_cols if c not in df.columns]
+        if missing:
+            raise ValueError(f"prod mode missing feature cols in training df: {missing}")
+
+        used_cols = ["cust_id", "date", "T", "Y"] + feature_cols
+        train_df = df[used_cols].copy()
+        train_df[feature_cols] = train_df[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    cate = _train_and_predict_drlearner(
+        train_df=train_df,
+        feature_cols=feature_cols,
+        train_cfg=train_cfg,
+        model_path=paths["model_path"],
+    )
+    cate = cate.astype(np.float32) if train_cfg.cate_float32 else cate.astype(np.float64)
+
+    out = bundle_eval_df.copy()
+    out["cate"] = cate
+
+    # 落盘 cate（只存 join keys + cate，避免重复存 T/Y）
+    gkey = ["cust_id", "date"]
+    cate_out = out[gkey + ["cate"]].copy()
+
+    if train_cfg.prefer_parquet:
+        cate_out.to_parquet(paths["cate_path"], index=False)
+    else:
+        cate_out.to_csv(paths["cate_path"], index=False)
+
+    return out
+
+
+# =========================
 # 组合专属指标：synergy / overlap / incremental-to-base
 # =========================
 
@@ -383,16 +732,27 @@ def run_bundle_mining_backtest(
     customer_cfg: Optional[CustomerDecisionConfig] = None,
     safety_cfg: Optional[SafetyConfig] = None,
     backtest_cfg: Optional[BacktestConfig] = None,
-    synthesize_cate_mode: Optional[str] = "min",
+    train_cfg: Optional[BundleTrainConfig] = None,
+    features_df: Optional[pd.DataFrame] = None,
+    synthesize_cate_mode: str = "min",
 ) -> Dict[str, pd.DataFrame]:
     """
+    Debug/研究入口：依赖 eval_df（长表），用于快速跑通组合评估/策略回测。
+
+    - debug：用单产品 cate 合成 bundle cate（min/mean/sum）
+    - prod ：仍然支持训练，但训练数据推荐从 per-product 文件读取（见 ensure_bundle_cate 的实现）
+
+    生产推荐使用 run_bundle_mining_prod_from_files()（不依赖 eval_df）。
+
     输出：
     - bundle_candidates_df
     - bundle_product_eval_df（每个 bundle 的产品层评估结果）
     - bundle_metrics_df（synergy/overlap/incremental）
-    - bundle_backtest_result_map（每个 bundle 一个 backtest dict；体积大，默认不落盘）
+    - bundle_backtest_result（复用 run_backtest 的返回 dict）
+    - bundle_eval_all（拼接后的 bundle 长表）
     """
     mining_cfg = mining_cfg or BundleMiningConfig()
+    train_cfg = train_cfg or BundleTrainConfig(mode="debug")
     validate_eval_df(eval_df)
 
     # 1) 候选
@@ -411,6 +771,21 @@ def run_bundle_mining_backtest(
     )
 
     # 2) 构造 bundle eval_df 并拼成一个“大 eval_df”（bundle 维度）
+    # 性能优化：先把 eval_df 裁剪到本次 bundles 涉及的产品集合，避免每个 bundle 都扫全量
+    needed_products = set()
+    for b in bundles:
+        needed_products.update(map(str, b.products))
+
+    # 仅保留必要列（避免中间表过大）
+    base_cols = ["cust_id", "product_id", "date", "T", "Y"]
+    if "cate" in eval_df.columns:
+        base_cols.append("cate")
+    base_cols = [c for c in base_cols if c in eval_df.columns]
+
+    df_small = eval_df[base_cols].copy()
+    df_small["product_id"] = _as_str_product_id(df_small["product_id"])
+    df_small = df_small[df_small["product_id"].isin(needed_products)].copy()
+
     bundle_eval_frames: List[pd.DataFrame] = []
     kept: List[BundleCandidate] = []
 
@@ -419,16 +794,22 @@ def run_bundle_mining_backtest(
             raise NotImplementedError("当前版本只实现 AND bundle；如需 OR/序列，可继续扩展。")
 
         bdf = build_bundle_eval_df_and_mode(
-            eval_df=eval_df,
+            eval_df=df_small,
             bundle=b,
             min_bundle_support_rows=mining_cfg.min_bundle_support_rows,
         )
         if bdf.empty:
             continue
 
-        # 可选：用单产品 cate 合成，先把流程跑通
-        if synthesize_cate_mode is not None:
-            bdf = synthesize_bundle_cate(eval_df=eval_df, bundle_eval_df=bdf, bundle=b, mode=synthesize_cate_mode)
+        # 关键：按 mode 决定 cate 来源
+        bdf = ensure_bundle_cate(
+            eval_df=df_small,
+            bundle_eval_df=bdf,
+            bundle=b,
+            train_cfg=train_cfg,
+            features_df=features_df,
+            synthesize_cate_mode=synthesize_cate_mode,
+        )
 
         # backtest_full_pipeline 需要 REQUIRED_COLUMNS；我们多了 Y_std 不影响
         bundle_eval_frames.append(bdf)
@@ -498,6 +879,142 @@ def run_bundle_mining_backtest(
     }
 
 
+def run_bundle_mining_prod_from_files(
+    product_eval_df: pd.DataFrame,
+    mining_cfg: Optional[BundleMiningConfig] = None,
+    product_cfg_for_bundle: Optional[ProductDecisionConfig] = None,
+    customer_cfg: Optional[CustomerDecisionConfig] = None,
+    safety_cfg: Optional[SafetyConfig] = None,
+    backtest_cfg: Optional[BacktestConfig] = None,
+    train_cfg: Optional[BundleTrainConfig] = None,
+) -> Dict[str, pd.DataFrame]:
+    """
+    生产入口：完全不依赖 eval_df。
+
+    输入：
+    - product_eval_df：单产品评估结果（用于候选生成：recommend_all / recommend_targeted / product_score / tag）
+    - train_cfg：必须为 mode="prod"，并配置 per_product_data_dir / feature_cols / 文件格式等
+      每个产品一个文件，列为 [cust_id, date, X..., T, Y]
+
+    流程：
+    1) 生成 bundle candidates
+    2) 对每个 bundle：
+       - 从 per-product 文件构造 bundle 训练集（cust_id,date,X,T_bundle,Y）
+       - 训练/预测 cate_bundle（带缓存：bundle_artifacts/{bundle_id}/cate.parquet）
+       - 构造 bundle_eval_long：cust_id,date,product_id=bundle_id,cate,T,Y
+    3) concat 所有 bundle_eval_long，复用 run_backtest() 输出评估与策略结果
+    """
+    mining_cfg = mining_cfg or BundleMiningConfig()
+    train_cfg = train_cfg or BundleTrainConfig(mode="prod")
+    if train_cfg.mode != "prod":
+        raise ValueError("run_bundle_mining_prod_from_files requires train_cfg.mode='prod'")
+
+    # 1) 候选
+    bundles = generate_bundle_candidates(product_eval_df, cfg=mining_cfg)
+    bundle_candidates_df = pd.DataFrame(
+        [
+            {
+                "bundle_id": b.bundle_id,
+                "products": ",".join(map(str, b.products)),
+                "base_product": b.base_product,
+                "boosters": ",".join(map(str, b.booster_products)) if b.booster_products else "",
+                "bundle_size": len(b.products),
+            }
+            for b in bundles
+        ]
+    )
+
+    bundle_eval_frames: List[pd.DataFrame] = []
+    kept: List[BundleCandidate] = []
+
+    for b in bundles:
+        # 构造训练集（从文件读取），并训练/预测 cate
+        train_df = _build_bundle_train_df_from_per_product_files(bundle=b, train_cfg=train_cfg)
+
+        # 支持度门槛（AND 的 treated 样本不足时不训练）
+        if mining_cfg.min_bundle_support_rows > 0:
+            treated_n = int((train_df["T"] == 1).sum())
+            if treated_n < int(mining_cfg.min_bundle_support_rows):
+                continue
+
+        # 用 bundle_eval_df 的形态承载 cate（与 backtest 输入对齐）
+        bundle_eval_df = train_df[["cust_id", "date", "T", "Y"]].copy()
+        bundle_eval_df["product_id"] = b.bundle_id
+        bundle_eval_df["cate"] = np.nan
+        bundle_eval_df = bundle_eval_df[["cust_id", "product_id", "date", "cate", "T", "Y"]]
+
+        bundle_eval_df = ensure_bundle_cate(
+            eval_df=bundle_eval_df,  # prod 下不会用到 eval_df 的内容（只用于函数签名兼容）
+            bundle_eval_df=bundle_eval_df,
+            bundle=b,
+            train_cfg=train_cfg,
+            features_df=None,
+            synthesize_cate_mode="min",
+        )
+
+        bundle_eval_frames.append(bundle_eval_df)
+        kept.append(b)
+
+    if not bundle_eval_frames:
+        return {
+            "bundle_candidates_df": bundle_candidates_df,
+            "bundle_product_eval_df": pd.DataFrame(),
+            "bundle_metrics_df": pd.DataFrame(),
+        }
+
+    bundle_eval_all = pd.concat(bundle_eval_frames, axis=0, ignore_index=True)
+
+    # 复用回测
+    bundle_result = run_backtest(
+        eval_df=bundle_eval_all,
+        external_metrics_df=None,
+        product_config=product_cfg_for_bundle or ProductDecisionConfig(
+            min_support_samples=max(50, int(mining_cfg.min_bundle_support_rows)),
+            max_negative_uplift_ratio=0.55,
+            top_ratio=0.2,
+            enable_calibration=True,
+        ),
+        customer_config=customer_cfg or CustomerDecisionConfig(min_cate=0.0, top_k_per_customer=1),
+        safety_config=safety_cfg or SafetyConfig(min_customer_expected_gain=0.0),
+        backtest_config=backtest_cfg or BacktestConfig(),
+    )
+
+    bundle_product_eval_df = bundle_result["product_eval_df"].copy()
+    bundle_product_eval_df["product_id"] = _as_str_product_id(bundle_product_eval_df["product_id"])
+
+    bundle_map: Dict[str, BundleCandidate] = {b.bundle_id: b for b in kept}
+
+    rows: List[Dict] = []
+    for _, r in bundle_product_eval_df.iterrows():
+        bid = str(r["product_id"])
+        b = bundle_map.get(bid)
+        if b is None:
+            continue
+        rows.append(
+            {
+                "bundle_id": bid,
+                "products": ",".join(map(str, b.products)),
+                "synergy_score": compute_synergy_score(r, product_eval_df=product_eval_df, bundle=b),
+                "overlap_ratio_top": np.nan,  # 生产不一定有单产品 cate 长表，这里先留空
+                "incremental_to_base": compute_incremental_to_base(r, product_eval_df=product_eval_df, bundle=b),
+            }
+        )
+
+    bundle_metrics_df = pd.DataFrame(rows)
+
+    bundle_product_eval_df = bundle_product_eval_df.merge(
+        bundle_metrics_df, left_on="product_id", right_on="bundle_id", how="left"
+    ).drop(columns=["bundle_id"], errors="ignore")
+
+    return {
+        "bundle_candidates_df": bundle_candidates_df,
+        "bundle_product_eval_df": bundle_product_eval_df,
+        "bundle_metrics_df": bundle_metrics_df,
+        "bundle_backtest_result": bundle_result,
+        "bundle_eval_all": bundle_eval_all,
+    }
+
+
 if __name__ == "__main__":
     # Demo：用 backtest_full_pipeline 的模拟数据做一次 bundle mining 演示
     from backtest_full_pipeline import EvalDFSimConfig, simulate_evaldf, evaluate_products
@@ -515,6 +1032,7 @@ if __name__ == "__main__":
     # 先做单产品评估，得到 recommend_all / recommend_targeted
     single_prod_eval = evaluate_products(eval_df)
 
+    # debug 模式：用单品 cate 合成 bundle cate（仅演示流程）
     result = run_bundle_mining_backtest(
         eval_df=eval_df,
         product_eval_df=single_prod_eval,
@@ -525,9 +1043,11 @@ if __name__ == "__main__":
             top_n_booster=6,
             min_bundle_support_rows=300,
         ),
-        synthesize_cate_mode="min",  # 仅demo
+        train_cfg=BundleTrainConfig(mode="debug"),
+        synthesize_cate_mode="min",
     )
 
     print("bundle_candidates:", result["bundle_candidates_df"].shape)
     print("bundle_product_eval:", result["bundle_product_eval_df"].shape)
-    print(result["bundle_product_eval_df"][["product_id", "recommendation_decision", "ate", "synergy_score", "overlap_ratio_top"]].head(10))
+    show_cols = [c for c in ["product_id", "recommendation_decision", "ate", "synergy_score", "overlap_ratio_top"] if c in result["bundle_product_eval_df"].columns]
+    print(result["bundle_product_eval_df"][show_cols].head(10))

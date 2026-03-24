@@ -57,7 +57,7 @@ A:
 - `overlap_ratio_top`：Top uplift 客群重叠率（高说明冗余，低说明互补）
 - `incremental_to_base = ATE(bundle) - ATE(base)`（仅 Base+Booster 组合）
 
-## 5. 快速跑 demo
+## 5. 快速跑 demo（Debug）
 
 ```bash
 python bundle_mining_pipeline.py
@@ -69,10 +69,59 @@ python bundle_mining_pipeline.py
 - `bundle_product_eval` shape
 - `bundle_product_eval_df` 的前几行（含 ate / synergy / overlap）
 
-若要把它接到真实数据，请将你的单产品 eval_df（含 cate/T/Y）读入，然后：
+## 6. 两条入口（Debug vs Prod）
 
-- 先用 `backtest_full_pipeline.evaluate_products(eval_df)` 得到 `product_eval_df`
-- 再调用 `bundle_mining_pipeline.run_bundle_mining_backtest(eval_df, product_eval_df, ...)`
+### 6.1 Debug / 研究入口（依赖 eval_df 长表）
+用于快速跑通流程与调试组合逻辑（可用单品 cate 合成 bundle cate）。
+
+输入 `eval_df`（长表）至少包含：
+- `cust_id, product_id, date, T, Y`
+- 若要计算 `overlap_ratio_top` 或合成 bundle cate，还需要 `cate`
+
+示例：
+```python
+from bundle_mining_pipeline import BundleMiningConfig, BundleTrainConfig, run_bundle_mining_backtest
+
+result = run_bundle_mining_backtest(
+    eval_df=eval_df,
+    product_eval_df=product_eval_df,  # 单品 backtest 得到的 product_eval_df（含 recommendation_decision/product_score）
+    mining_cfg=BundleMiningConfig(top_n_base=6, top_n_booster=6, min_bundle_support_rows=300),
+    train_cfg=BundleTrainConfig(mode="debug"),
+    synthesize_cate_mode="min",       # min/mean/sum
+)
+```
+
+### 6.2 Prod / 生产入口（完全从每产品 feature_df 文件取数）
+用于“重新训练 bundle 模型并推理 cate_bundle”，不依赖 eval_df。
+
+每个产品一个文件，粒度为 `cust_id,date`，包含：
+- `cust_id, date, X..., T, Y`
+
+示例：
+```python
+from bundle_mining_pipeline import BundleMiningConfig, BundleTrainConfig, run_bundle_mining_prod_from_files
+
+result = run_bundle_mining_prod_from_files(
+    product_eval_df=product_eval_df,  # 单品评估产物，用于生成组合候选
+    mining_cfg=BundleMiningConfig(top_n_base=8, top_n_booster=8, min_bundle_support_rows=500),
+    train_cfg=BundleTrainConfig(
+        mode="prod",
+        per_product_data_dir=r"你的单产品文件目录",
+        per_product_file_pattern="{product_id}.parquet",
+        per_product_file_format="parquet",
+        feature_cols=["x1", "x2", "x3"],  # 你的特征列名列表
+        t_col="T",
+        y_col="Y",
+        artifacts_dir="bundle_artifacts",
+        force_retrain=False,
+        learner_params={"n_estimators": 200, "min_samples_leaf": 50, "n_jobs": -1},
+    ),
+)
+```
+
+说明：
+- prod 模式会在 `bundle_artifacts/{bundle_id}/` 下缓存 `cate.parquet` 与 `drlearner_model.pkl`；若缓存存在且 `force_retrain=False` 会直接复用。
+- prod 模式默认按 AND 定义 `T_bundle = min(T_i)`。
 
 📊 项目核心环节概览
 
