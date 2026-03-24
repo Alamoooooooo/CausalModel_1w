@@ -123,6 +123,82 @@ result = run_bundle_mining_prod_from_files(
 - prod 模式会在 `bundle_artifacts/{bundle_id}/` 下缓存 `cate.parquet` 与 `drlearner_model.pkl`；若缓存存在且 `force_retrain=False` 会直接复用。
 - prod 模式默认按 AND 定义 `T_bundle = min(T_i)`。
 
+## 7. 关键函数速查（定义 + 作用）
+
+> 文件位置：`bundle_mining_pipeline.py`  
+> 说明：这里列出你在调试/生产中最常用、最关键的函数；后续你也可以把它当作“接口文档”。
+
+### 7.1 候选生成相关
+
+- `generate_bundle_candidates(product_eval_df, cfg=None) -> List[BundleCandidate]`  
+  作用：从单产品评估表 `product_eval_df` 生成 bundle 候选，默认模板为：
+  - Base 池：`recommend_all` TopN
+  - Booster 池：`recommend_targeted` TopN
+  - 组合：Base+Booster 与 Base+Base（并控制组合规模，避免 2^34 爆炸）
+
+- `BundleCandidate`（dataclass）  
+  作用：描述一个 bundle 候选（bundle_id / products / base_product / booster_products）。
+
+### 7.2 Debug 入口（依赖 eval_df 长表）
+
+- `run_bundle_mining_backtest(eval_df, product_eval_df, ..., train_cfg=None, synthesize_cate_mode="min") -> Dict[str, pd.DataFrame]`  
+  作用：调试/研究入口。依赖 long-format `eval_df`（cust_id,product_id,date,T,Y,cate可选），构造 bundle 长表并复用 `run_backtest()` 做评估/推荐/策略收益。  
+  - `train_cfg.mode="debug"`：用 `synthesize_bundle_cate()` 合成 bundle cate  
+  - `train_cfg.mode="prod"`：也支持训练，但一般生产更推荐直接用 `run_bundle_mining_prod_from_files()`（完全不依赖 eval_df）
+
+- `build_bundle_eval_df_and_mode(eval_df, bundle, min_bundle_support_rows=0) -> pd.DataFrame`  
+  作用：在 debug 链路中，从 eval_df 聚合出 bundle 的 `(cust_id,date)` 样本：  
+  - `T_bundle = AND(T_i)`（实现为 min）  
+  - `Y` 同一 `(cust_id,date)` 下做 mean，并输出 `Y_std` 作为一致性检查
+
+- `synthesize_bundle_cate(eval_df, bundle_eval_df, bundle, mode="min") -> pd.DataFrame`  
+  作用：仅调试用，把单产品 cate 合成 bundle cate：  
+  - `min`（保守、AND 语义更合理）/ `mean` / `sum`
+
+### 7.3 Prod 入口（从每产品 feature_df 文件读取）
+
+- `run_bundle_mining_prod_from_files(product_eval_df, ..., train_cfg=None) -> Dict[str, pd.DataFrame]`  
+  作用：生产入口，不需要 eval_df。对每个 bundle：从单产品文件读取、构造训练集、训练 DRLearner、推理 cate_bundle，再拼成 bundle 长表喂给 `run_backtest()`。
+
+- `_read_per_product_df(product_id, train_cfg, usecols=None) -> pd.DataFrame`  
+  作用：真正“从磁盘读取单产品文件”的函数。  
+  - 路径：`train_cfg.per_product_data_dir/train_cfg.per_product_file_pattern.format(product_id=...)`  
+  - 格式：`train_cfg.per_product_file_format`（parquet/csv）  
+  - 返回列至少包含：`cust_id, date, T, Y`（以及你配置的 `feature_cols`）
+
+- `_build_bundle_train_df_from_per_product_files(bundle, train_cfg) -> pd.DataFrame`  
+  作用：对一个 bundle 读取并对齐多个产品文件，构造 bundle 训练集：  
+  - 按 `cust_id,date` inner-merge（保留交集）  
+  - 构造 `T_bundle = min(T_i)`（AND）、`Y = mean(Y_i)`  
+  - `X` 默认取 base 产品文件中的 `feature_cols`
+
+- `ensure_bundle_cate(eval_df, bundle_eval_df, bundle, train_cfg, features_df=None, synthesize_cate_mode="min") -> pd.DataFrame`  
+  作用：统一的 cate 生成入口（debug/prod 共用）：  
+  - debug：调用 `synthesize_bundle_cate()`  
+  - prod：优先读缓存；无缓存则训练 causalml DRLearner 并预测 cate，再落盘缓存
+
+### 7.4 训练/缓存相关（prod）
+
+- `_bundle_artifact_paths(train_cfg, bundle_id) -> Dict[str, str]`  
+  作用：生成每个 bundle 的落盘路径（模型/预测结果）。
+
+- `_load_cached_bundle_cate(cate_path, bundle_eval_df, train_cfg) -> Optional[pd.DataFrame]`  
+  作用：若存在缓存 cate（parquet/csv），则读出并 merge 回 bundle_eval_df。
+
+- `_train_and_predict_drlearner(train_df, feature_cols, train_cfg, model_path=None) -> np.ndarray`  
+  作用：训练 causalml `BaseDRLearner` 并按行输出 cate 预测；可选落盘模型到 `model_path`。
+
+### 7.5 组合解释指标（可选）
+
+- `compute_synergy_score(bundle_product_eval_row, product_eval_df, bundle) -> float`  
+  作用：`synergy = ATE(bundle) - ΣATE(product_i)`。
+
+- `compute_top_overlap_ratio(eval_df, bundle, top_ratio=0.2) -> float`  
+  作用：基于单产品 cate 的 Top uplift 人群重叠率（需要 debug 的 eval_df/cate）。
+
+- `compute_incremental_to_base(bundle_product_eval_row, product_eval_df, bundle) -> float`  
+  作用：`incremental_to_base = ATE(bundle) - ATE(base)`（Base+Booster 模板时更有意义）。
+
 📊 项目核心环节概览
 
 首先，我们用下面这个表格来快速把握整个项目的核心环节与关键点。
