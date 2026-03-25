@@ -1751,10 +1751,10 @@ if __name__ == "__main__":
     # --------------------------------------------------------
     # 调试用：模拟一份 eval_df（按需调参）
     sim_cfg = EvalDFSimConfig(
-        n_customers=50_000,
-        n_products=40,
-        n_dates=3,
-        chunk_rows=0,        # 大数据建议设为 2_000_000 之类，做分块调试
+        n_customers=40_000,
+        n_products=34,
+        n_dates=100,
+        chunk_rows=2_000_000,        # 大数据建议设为 2_000_000 之类，做分块调试
         use_category=True,
         use_float32=True,
         random_state=42,
@@ -1766,8 +1766,8 @@ if __name__ == "__main__":
     # --------------------------------------------------------
 
     # 1) 自动建议阈值（可选）
-    # suggestion = suggest_default_thresholds(eval_df)
-    # print("Suggested thresholds:", suggestion)
+    suggestion = suggest_default_thresholds(eval_df)
+    print("Suggested thresholds:", suggestion)
 
     # 2) 正式回测
     result = run_backtest(
