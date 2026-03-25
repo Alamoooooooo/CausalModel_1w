@@ -63,6 +63,7 @@ def render_business_report_v3(
     reco_empirical_eval_df = result.get("reco_empirical_eval_df", pd.DataFrame()).copy()
     policy_gain_df = result.get("policy_gain_df", pd.DataFrame()).copy()
     temporal_df = result.get("temporal_df", pd.DataFrame()).copy()
+    temporal_reco_df = result.get("temporal_reco_df", pd.DataFrame()).copy()
     ope_df = result.get("ope_df", pd.DataFrame()).copy()
 
     # 关键数值
@@ -157,6 +158,11 @@ def render_business_report_v3(
         if (temporal_df is not None and not temporal_df.empty)
         else pd.DataFrame(columns=["date", "model_ate", "empirical_uplift", "treated_n", "control_n"])
     )
+    temporal_reco_show = (
+        temporal_reco_df
+        if (temporal_reco_df is not None and not temporal_reco_df.empty)
+        else pd.DataFrame(columns=["date", "reco_model_ate", "reco_empirical_uplift", "treated_n", "control_n"])
+    )
     ope_show = (
         ope_df
         if (ope_df is not None and not ope_df.empty)
@@ -226,6 +232,29 @@ def render_business_report_v3(
     md.append(f"### 2.3 Top 产品列表（按 decision + score 排序，Top {top_products}）\n")
     md.append(_table(prod_show) + "\n")
 
+    md.append("### 2.4 如何解读产品层结果（好/坏信号）\n")
+    md.append(
+        "\n".join(
+            [
+                "**好信号（更可能可上线）**：",
+                "- `ate>0` 且 `empirical_uplift>0`（方向一致，且真实结果口径为正）",
+                "- `qini/auuc` 较高（说明排序“会挑人”，定向价值更大）",
+                "- `top_uplift_lift`、`top_vs_rest_gap` 明显 > 0（Top 人群显著更好）",
+                "- `negative_uplift_ratio` 低（风险小）",
+                "- `sample_size`/`n_customer` 充足（估计更稳健）",
+                "- `pass_rate` 高，且 `recommendation_decision` 为 `recommend_all` 或 `recommend_targeted`",
+                "",
+                "**坏信号（需要观察/调参/重训）**：",
+                "- `ate` 与 `empirical_uplift` 长期反向（优先排查口径/漂移/校准/混杂）",
+                "- `negative_uplift_ratio` 高（容易误伤用户）",
+                "- 样本量过小仍靠前（可能是噪声，建议提高 `min_support_samples`）",
+                "- `top_uplift_lift` 很低/为负（说明挑人能力不足）",
+                "",
+            ]
+        )
+        + "\n"
+    )
+
     md.append("## 三、客户层推荐（Customer Level Recommendations）\n")
     md.append(
         "\n".join(
@@ -252,6 +281,25 @@ def render_business_report_v3(
     md.append(f"展示 Top {top_reco_rows} 条推荐记录（按 recommend_score 降序）：\n")
     md.append(_table(reco_show) + "\n")
 
+    md.append("### 3.3 如何解读客户层推荐（好/坏信号）\n")
+    md.append(
+        "\n".join(
+            [
+                "**好信号**：",
+                "- 推荐清单里 `adjusted_cate` 大多为正，且头部记录（rank=1）明显更高",
+                "- 同一客户 Top1 的 `recommend_score` 明显高于 Top3（排序分有区分度）",
+                "- 推荐主要来自产品层 `recommend_all/recommend_targeted` 池（策略一致、可控）",
+                "",
+                "**坏信号**：",
+                "- 大量推荐记录 `adjusted_cate<=0` 仍被输出（通常是 `min_cate` 太低、校准异常或数据噪声）",
+                "- 推荐过度集中在少数产品，但这些产品 `empirical_uplift`/风险指标一般（可能权重偏“强产品”或门禁太松）",
+                "- 客户内 rank 的分数差异很小（说明 score 信号弱，需调权重或加更强的门禁）",
+                "",
+            ]
+        )
+        + "\n"
+    )
+
     md.append("## 四、策略收益曲线（Policy Gain Curve）\n")
     md.append(
         "\n".join(
@@ -269,6 +317,23 @@ def render_business_report_v3(
     )
     md.append(_table(policy_show) + "\n")
 
+    md.append("### 4.3 如何解读策略收益曲线（好/坏信号）\n")
+    md.append(
+        "\n".join(
+            [
+                "**好信号**：",
+                "- `uplift_gain` 随 `top_pct` 增大应逐步下降并最终趋近 0（top 1% > top 2% > ...）",
+                "- top 小比例（如 1%/2%/5%）`uplift_gain` 明显 > 0（说明排序有用）",
+                "- 可用“曲线拐点”确定触达规模：从 1% 增到 5% 收益仍高，但到 30% 变平，说明扩大触达会稀释效果",
+                "",
+                "**坏信号**：",
+                "- 曲线不单调或 top 小比例≈0/为负（说明推荐分与真实 Y 关系弱，需调权重/重训/排查口径）",
+                "",
+            ]
+        )
+        + "\n"
+    )
+
     md.append("## 五、时间稳定性（Temporal Stability）\n")
     md.append(
         "\n".join(
@@ -276,16 +341,48 @@ def render_business_report_v3(
                 "### 5.1 时间稳定性在讲什么？",
                 "- 目的：检查模型/推荐效果是否随时间漂移；若某天明显变差，可能是数据分布/活动/人群变化导致。",
                 "",
-                "### 5.2 字段解释",
+                "### 5.2 全量时间稳定性（全量产品/全量样本）字段解释",
                 "- `date`：日期。",
-                "- `model_ate`：当日平均 cate（模型视角的平均处理效应）。",
-                "- `empirical_uplift`：当日经验 uplift（treated 平均Y - control 平均Y）。",
-                "- `treated_n`/`control_n`：当日 treated/control 样本量（样本量太小会导致 uplift 不稳定）。",
+                "- `model_ate`：当日平均 cate（全量样本的模型视角平均处理效应）。",
+                "- `empirical_uplift`：当日经验 uplift（全量样本 treated 平均Y - control 平均Y）。",
+                "- `treated_n`/`control_n`：当日 treated/control 样本量。",
+                "- 说明：该口径适合做“全局健康度/漂移监控”，可能会被大量无效产品稀释。",
                 "",
             ]
         )
     )
     md.append(_table(temporal_show) + "\n")
+
+    md.append("### 5.3 推荐子集时间稳定性（仅最终推荐清单）\n")
+    md.append(
+        "\n".join(
+            [
+                "- 目的：只看最终输出的 `customer_reco_df`（经过产品门禁/客户门禁后的推荐清单），避免全量无因果产品对总体的稀释。",
+                "- `reco_model_ate`：推荐清单内（默认用 `adjusted_cate`）的当日均值。",
+                "- `reco_empirical_uplift`：推荐清单内 treated 平均Y - control 平均Y。",
+                "- `treated_n`/`control_n`：推荐清单内 treated/control 样本量。",
+                "",
+            ]
+        )
+    )
+    md.append(_table(temporal_reco_show) + "\n")
+
+    md.append("### 5.4 如何解读时间稳定性（好/坏信号）\n")
+    md.append(
+        "\n".join(
+            [
+                "**好信号**：",
+                "- `empirical_uplift` 比较平稳，且与 `model_ate` 大体同向变化",
+                "- `treated_n/control_n` 稳定且不太小（样本量充足时结论更可信）",
+                "",
+                "**坏信号**：",
+                "- `empirical_uplift` 断崖式波动且样本量并不小（更可能是分布漂移/活动变化/数据口径变化）",
+                "- 某些日期 treated/control 极不平衡（经验 uplift 会变得不稳定）",
+                "",
+            ]
+        )
+        + "\n"
+    )
 
     md.append("## 六、离线策略价值评估（OPE）\n")
     md.append(
@@ -306,6 +403,18 @@ def render_business_report_v3(
         )
     )
     md.append(_table(ope_show) + "\n")
+
+    md.append("### 6.3 如何解读 OPE（若未计算可忽略）\n")
+    md.append(
+        "\n".join(
+            [
+                "- 只有当 `ipw_ok/dr_ok=True` 时，才建议把 `ipw_value/dr_value` 纳入判断。",
+                "- 若缺少 `ps` 或 `mu0/mu1` 导致无法计算（报告会写明原因），请忽略该部分，不影响其它章节对“好/坏”的判断。",
+                "",
+            ]
+        )
+        + "\n"
+    )
 
     md.append("## 七、ps / mu0 / mu1 是什么？怎么计算？（给数据准备同学）\n")
     md.append(
@@ -413,6 +522,50 @@ def render_business_report_v3(
         + "\n"
     )
 
+    md.append("## 九、如何解读回测好坏（Interpretation Checklist）\n")
+    md.append(
+        "\n".join(
+            [
+                "本项目的“回测”是离线验证：用模型的 uplift（`cate`）决定“推给谁”，再用历史数据中的 `T/Y` 做 sanity check 与策略收益模拟。",
+                "建议按 **必须过线 / 加分项 / 风险项** 三类信号来判断效果好坏。",
+                "",
+                "### 9.1 这套回测到底怎么测的？（口径说明）",
+                "- **产品层（Product Level）**：对每个产品汇总 `cate` 得到 `ate`，并用历史 `T/Y` 计算 `empirical_uplift=mean(Y|T=1)-mean(Y|T=0)` 作为经验对照；再用 `cate` 排序构造 proxy 的 `qini/auuc/top_uplift_lift` 衡量“会不会挑人”。",
+                "- **客户层（Customer Level）**：在可推荐产品池中，对每个客户按 `recommend_score` 排序取 Top-K，形成推荐清单 `customer_reco_df`。",
+                "- **策略层（Policy Level）**：",
+                "  - `policy_gain_df`：把推荐分从高到低取 top 1%/5%/…，看这些样本平均 `Y` 比全体平均 `Y` 高多少（当前实现口径）。",
+                "  - `temporal_df`：按日期观察 `model_ate` 与 `empirical_uplift` 是否稳定，排查漂移。",
+                "  - `ope_df`：当你提供 `ps/mu0/mu1` 时可做 IPW/DR 的离线策略评估（v3 默认不回读全量 parquet 做 OPE，因此会提示如何扩展）。",
+                "",
+                "### 9.2 必须过线（不然说明策略/模型基本不可用）",
+                "1) **方向一致性**：进入推荐池（recommend_all/targeted）的产品，`ate` 与 `empirical_uplift` 不应长期大量反向。",
+                "   - 若大量出现 `ate>0` 但 `empirical_uplift<0`：优先排查数据泄露、标签口径、分布漂移、校准过强、或 treated/control 结构性差异。",
+                "2) **收益曲线形状**：`policy_gain_df.uplift_gain` 随 `top_pct` 增大应逐步下降并趋近 0；top 1%/2% 通常应明显高于 top 50%。",
+                "   - 若 top 很小比例仍不如整体：排序几乎无效（或推荐分与真实收益无关）。",
+                "3) **时间稳定性**：`temporal_df` 中 `empirical_uplift` 不应在样本量足够（treated_n/control_n 大）时出现断崖式变动。",
+                "",
+                "### 9.3 加分项（越多越好，说明更可上线）",
+                "- 推荐池产品数量合理（不为 0，也不是几乎全量）。",
+                "- `negative_uplift_ratio` 低（更安全）。",
+                "- `top_uplift_lift`、`top_vs_rest_gap` 明显 > 0（说明模型“会挑人”，适合定向）。",
+                "- `reco_empirical_eval_df.empirical_uplift` 为正且量级符合业务预期（推荐清单子集的经验 uplift sanity check）。",
+                "",
+                "### 9.4 风险项（看到要警惕，通常需要调参/加门禁/重训）",
+                "- `negative_uplift_ratio` 高但仍被推荐：门禁太松/安全权重太低。",
+                "- 小样本产品（sample_size/n_customer 很小）排到很前：可能噪声大，建议提高 `min_support_samples` 或加置信度判断。",
+                "- `empirical_uplift` 与 `ate` 偏离很大：考虑关闭/调整校准（enable_calibration）、或按业务口径重新训练模型。",
+                "- policy curve 不单调：考虑调整 `recommend_score` 权重、提高 `min_cate`、或把风险项权重调高。",
+                "",
+                "### 9.5 常用排查与调参建议（快速指引）",
+                "- **想更保守、更安全**：降低 `max_negative_uplift_ratio`、提高 `min_support_samples`、提高客户侧 `min_cate` / `min_customer_expected_gain`、提高推荐分里安全项权重。",
+                "- **想更激进、更覆盖**：放宽 `min_ate/min_empirical_uplift/min_qini`、降低 `min_cate`、提高 `top_k_per_customer`。",
+                "- **想更强调“挑人”能力（定向更尖）**：提高 `min_qini/min_auuc/min_top_uplift_lift`，并调小 `targeted_top_ratio`（只给最头部人群）。",
+                "",
+            ]
+        )
+        + "\n"
+    )
+
     md.append("## 附录：输出数据表说明\n")
     md.append(
         "\n".join(
@@ -421,7 +574,8 @@ def render_business_report_v3(
                 "- `customer_reco_df`：客户-产品推荐清单（含 adjusted_cate / recommend_score；若无 ps/mu 则为空/NULL）",
                 "- `reco_empirical_eval_df`：推荐子集的 treated-control uplift（sanity check）",
                 "- `policy_gain_df`：不同触达比例下的收益曲线（经验口径）",
-                "- `temporal_df`：按 date 维度的 model_ate vs empirical_uplift",
+                "- `temporal_df`：按 date 维度的 model_ate vs empirical_uplift（全量产品/全量样本）",
+                "- `temporal_reco_df`：按 date 维度的 reco_model_ate vs reco_empirical_uplift（仅推荐清单子集）",
                 "- `ope_df`：离线策略价值评估（若缺 ps/mu 会自动降级并写明原因）",
             ]
         )
@@ -921,6 +1075,10 @@ def policy_gain_curve_duckdb(
 
 
 def temporal_stability_duckdb(parquet_dir: str, duckdb_path: Optional[str] = None) -> pd.DataFrame:
+    """
+    全量时间稳定性（全量 eval 表，包含所有产品/样本）。
+    用于监控整体口径/数据漂移，可能会被大量“无效产品/无因果”稀释。
+    """
     con = _duckdb_connect(duckdb_path)
     glob = _parquet_glob(parquet_dir)
     con.execute(f"CREATE OR REPLACE VIEW eval AS SELECT * FROM read_parquet('{glob}', hive_partitioning=1);")
@@ -949,6 +1107,37 @@ def temporal_stability_duckdb(parquet_dir: str, duckdb_path: Optional[str] = Non
     df = con.execute(sql).df()
     con.close()
     return df
+
+
+def temporal_stability_reco_df(
+    customer_reco_df: pd.DataFrame,
+    score_col_for_model: str = "adjusted_cate",
+) -> pd.DataFrame:
+    """
+    推荐子集时间稳定性（只看最终输出的 customer_reco_df）。
+    用于回答“真正要上线触达的人群/产品池”在时间上的稳定性，避免被全量无效产品稀释。
+    """
+    if customer_reco_df is None or customer_reco_df.empty:
+        return pd.DataFrame(columns=["date", "reco_model_ate", "reco_empirical_uplift", "treated_n", "control_n"])
+
+    d = customer_reco_df.copy()
+    if score_col_for_model not in d.columns:
+        score_col_for_model = "cate" if "cate" in d.columns else d.columns[0]
+
+    g = d.groupby("date", dropna=False)
+    treated_mean = g.apply(lambda x: x.loc[x["T"] == 1, "Y"].mean())
+    control_mean = g.apply(lambda x: x.loc[x["T"] == 0, "Y"].mean())
+
+    out = pd.DataFrame(
+        {
+            "date": treated_mean.index,
+            "reco_model_ate": g[score_col_for_model].mean().values,
+            "reco_empirical_uplift": (treated_mean - control_mean).values,
+            "treated_n": g.apply(lambda x: int((x["T"] == 1).sum())).values,
+            "control_n": g.apply(lambda x: int((x["T"] == 0).sum())).values,
+        }
+    )
+    return out.sort_values("date").reset_index(drop=True)
 
 
 # ============================================================
@@ -1059,6 +1248,7 @@ def run_backtest_v3(
     )
 
     temporal_df = temporal_stability_duckdb(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
+    temporal_reco_df = temporal_stability_reco_df(customer_reco_df, score_col_for_model="adjusted_cate")
 
     # OPE：根据列存在性降级
     parquet_cols = set(get_parquet_columns(parquet_dir, duckdb_path=duckdb_path))
@@ -1120,6 +1310,7 @@ def run_backtest_v3(
         "reco_empirical_eval_df": reco_emp,
         "policy_gain_df": policy_gain_df,
         "temporal_df": temporal_df,
+        "temporal_reco_df": temporal_reco_df,
         "ope_df": ope_df,
         # 让报告可以打印“本次运行参数快照”（便于复现/对比调参效果）
         "product_config": product_config,
