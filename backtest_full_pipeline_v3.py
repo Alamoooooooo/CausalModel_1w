@@ -328,6 +328,91 @@ def render_business_report_v3(
         + "\n"
     )
 
+    md.append("## 八、配置参数与调参指南（Config & Tuning Guide）\n")
+    md.append(
+        "\n".join(
+            [
+                "本章节解释：产品门禁（哪些产品能推荐）、客户层输出（每个客户推荐什么）、安全控制（更保守/更激进）、以及排序权重（更偏个性化/更偏强产品/更偏安全）。",
+                "",
+                "### 8.0 本次运行参数快照（便于复现）",
+                "- 说明：以下参数来自本次运行时传入 `run_backtest_v3()` 的 config。不同业务可按目标调参。",
+                "",
+                "#### ProductDecisionConfig",
+                f"- min_ate={_fmt(getattr(result.get('product_config', None), 'min_ate', None))}",
+                f"- min_empirical_uplift={_fmt(getattr(result.get('product_config', None), 'min_empirical_uplift', None))}",
+                f"- min_qini={_fmt(getattr(result.get('product_config', None), 'min_qini', None))}",
+                f"- min_auuc={_fmt(getattr(result.get('product_config', None), 'min_auuc', None))}",
+                f"- min_top_uplift_lift={_fmt(getattr(result.get('product_config', None), 'min_top_uplift_lift', None))}",
+                f"- max_negative_uplift_ratio={_fmt(getattr(result.get('product_config', None), 'max_negative_uplift_ratio', None))}",
+                f"- min_support_samples={_fmt(getattr(result.get('product_config', None), 'min_support_samples', None), 0)}",
+                f"- top_ratio={_fmt(getattr(result.get('product_config', None), 'top_ratio', None))}",
+                f"- enable_targeted_reco={getattr(result.get('product_config', None), 'enable_targeted_reco', None)}",
+                f"- targeted_top_ratio={_fmt(getattr(result.get('product_config', None), 'targeted_top_ratio', None))}",
+                f"- min_targeted_lift={_fmt(getattr(result.get('product_config', None), 'min_targeted_lift', None))}",
+                f"- allow_targeted_when_ate_negative={getattr(result.get('product_config', None), 'allow_targeted_when_ate_negative', None)}",
+                f"- enable_calibration={getattr(result.get('product_config', None), 'enable_calibration', None)}",
+                "",
+                "#### CustomerDecisionConfig",
+                f"- min_cate={_fmt(getattr(result.get('customer_config', None), 'min_cate', None))}",
+                f"- top_k_per_customer={_fmt(getattr(result.get('customer_config', None), 'top_k_per_customer', None), 0)}",
+                f"- min_product_pass_rate={_fmt(getattr(result.get('customer_config', None), 'min_product_pass_rate', None))}",
+                f"- customer_weight_col={getattr(result.get('customer_config', None), 'customer_weight_col', None)}",
+                "",
+                "#### SafetyConfig",
+                f"- enable_product_blacklist_gate={getattr(result.get('safety_config', None), 'enable_product_blacklist_gate', None)}",
+                f"- enable_customer_safe_filter={getattr(result.get('safety_config', None), 'enable_customer_safe_filter', None)}",
+                f"- min_customer_expected_gain={_fmt(getattr(result.get('safety_config', None), 'min_customer_expected_gain', None))}",
+                f"- max_customer_negative_share={_fmt(getattr(result.get('safety_config', None), 'max_customer_negative_share', None))}",
+                "",
+                "#### BacktestConfig",
+                f"- policy_bins={getattr(result.get('backtest_config', None), 'policy_bins', None)}",
+                f"- ps_clip_low={_fmt(getattr(result.get('backtest_config', None), 'ps_clip_low', None))}",
+                f"- ps_clip_high={_fmt(getattr(result.get('backtest_config', None), 'ps_clip_high', None))}",
+                "",
+                "说明：当前 v3 的 demo 入口里没有把 config 注入到 result 中；若你希望报告自动打印本次 config，我会在 v3 里把 config 对象一并放进 result（下方会实现）。",
+                "",
+                "### 8.1 产品门禁与决策参数（ProductDecisionConfig）怎么理解/怎么调？",
+                "- `min_ate`：ATE 下限。调大→更保守（产品池更小、平均效果更稳）；调小→更激进（覆盖更大、风险更高）。",
+                "- `min_empirical_uplift`：经验 uplift 下限。调大→更贴近历史真实结果、减少“模型幻觉”；调小→更多依赖模型 cate/排序能力。",
+                "- `min_qini` / `min_auuc`：排序能力门槛。调大→更强调“挑对人”（异质性强、定向价值高）；调小→更强调“平均有效”。",
+                "- `min_top_uplift_lift`：Top 人群比整体更强的门槛。调大→更偏强异质性产品；调小→更偏均匀有效产品。",
+                "- `max_negative_uplift_ratio`：负 uplift 占比上限（风险闸门）。调小→更安全但覆盖变小；调大→更激进但更可能误伤用户。",
+                "- `min_support_samples`：最小样本量。调大→更稳健但冷门产品容易被拒；调小→覆盖更多但估计更抖。",
+                "- `top_ratio`：Top uplift 相关指标（top_uplift_lift/top_vs_rest_gap）的 Top 比例。调小→更关注极头部；调大→更关注更大范围的好人群。",
+                "- `enable_targeted_reco`：是否启用定向推荐通道。关掉→只有 recommend_all/watchlist/reject。",
+                "- `targeted_top_ratio`：定向推荐开放的人群比例。调小→更保守（更少人被定向触达）；调大→更激进。",
+                "- `min_targeted_lift`：定向推荐的 lift 门槛。调大→更尖、更少产品进入 targeted；调小→更多产品可 targeted。",
+                "- `allow_targeted_when_ate_negative`：允许 ATE<0 但 Top 很强的产品走 targeted。开→偏增长型；关→偏安全型。",
+                "- `enable_calibration`：是否用 empirical_uplift/ate 做尺度校准。开→更贴近历史结果口径；关→保持模型尺度（更稳定但可能与业务指标尺度不一致）。",
+                "",
+                "### 8.2 客户层输出参数（CustomerDecisionConfig）怎么理解/怎么调？",
+                "- `min_cate`：客户-产品对的 uplift 门槛。调大→只推更确定增益的组合；调小→推荐更多但平均增益可能下降。",
+                "- `top_k_per_customer`：每个客户最多推荐多少条。调大→覆盖更广但可能稀释；调小→更聚焦。",
+                "- `min_product_pass_rate`：产品门禁通过率阈值（当前 v3 未用于强过滤，属于预留；若要生效可加到 SQL WHERE）。",
+                "- `customer_weight_col`：客户权重列（当前 v3 未使用，预留）。",
+                "",
+                "### 8.3 安全与回测参数（SafetyConfig / BacktestConfig）怎么理解/怎么调？",
+                "- `enable_product_blacklist_gate`：是否仅从 recommend_all/targeted 产品池中做候选。一般建议开启（更可控）。",
+                "- `enable_customer_safe_filter` + `min_customer_expected_gain`：客户侧最低期望增益过滤。调大→更保守；调小→更激进。",
+                "- `max_customer_negative_share`：客户层负收益容忍度（当前 v3 未显式使用，预留）。",
+                "- `policy_bins`：policy curve 的切分点。更密→更细但更复杂；更稀→更易解释但粗糙。",
+                "- `ps_clip_low/high`：ps 裁剪范围（仅 OPE）。clip 更紧→权重更稳定但偏差可能增大；clip 更松→方差更大（易出现极端权重）。",
+                "",
+                "### 8.4 排序权重（最常用调参旋钮）怎么调？",
+                "- 产品排序 `product_score` 有两套权重（mass vs targeted）：",
+                "  - 提高 `ate/empirical_uplift` 权重 → 更偏“平均收益更大”的产品",
+                "  - 提高 `qini/auuc/top_uplift_lift` 权重 → 更偏“更会挑人/异质性强”的产品",
+                "  - 提高 `(1 - negative_uplift_ratio)` 权重 → 更偏“更安全”的产品",
+                "- 客户层排序 `recommend_score = 0.65*norm_adjusted_cate + 0.25*norm_product_score + 0.10*(1-norm_neg_ratio)`：",
+                "  - 提高 adjusted_cate 权重 → 更个性化（更强调人-货匹配 uplift）",
+                "  - 提高 product_score 权重 → 更偏强产品（少数强产品更容易被推给更多人）",
+                "  - 提高安全项权重 → 更保守（减少可能负收益的人群）",
+                "",
+            ]
+        )
+        + "\n"
+    )
+
     md.append("## 附录：输出数据表说明\n")
     md.append(
         "\n".join(
@@ -1036,6 +1121,11 @@ def run_backtest_v3(
         "policy_gain_df": policy_gain_df,
         "temporal_df": temporal_df,
         "ope_df": ope_df,
+        # 让报告可以打印“本次运行参数快照”（便于复现/对比调参效果）
+        "product_config": product_config,
+        "customer_config": customer_config,
+        "safety_config": safety_config,
+        "backtest_config": backtest_config,
     }
 
 
