@@ -14,22 +14,18 @@ v3 目标（针对“真实数据没有 ps / mu0 / mu1”场景）：
       * ps + mu0 + mu1 均有：IPW + DR 都算
 - 输出：csv + v3 的 md 报告（含 ps/mu0/mu1 的定义与计算说明）
 
-注意：
-- “无 ps/mu 时仍然可以跑”的含义是：产品评估、推荐清单、policy curve、temporal、推荐子集 uplift 正常产出；
-  OPE 属于可选模块，缺列时会被跳过但不会报错。
+新增：
+- 单日可推荐子集链路（as_of_date + lookback_days）
+- 仅对固定日期做线上投放口径的推荐与评估
 """
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 
-
-# ============================================================
-# 报告工具
-# ============================================================
 
 def _fmt(x: object, nd: int = 4) -> str:
     if x is None or (isinstance(x, float) and (np.isnan(x) or np.isinf(x))):
@@ -47,12 +43,6 @@ def render_business_report_v3(
     top_products: int = 20,
     top_reco_rows: int = 50,
 ) -> str:
-    """
-    将 `run_backtest_v3()` 的输出整理成业务可读 Markdown 报告（v3）。
-    - 结构参考 v1/v2
-    - 增加 ps/mu0/mu1 的解释说明
-    - OPE 章节展示是否计算以及缺列原因
-    """
     import os
     from datetime import datetime
 
@@ -66,22 +56,19 @@ def render_business_report_v3(
     temporal_reco_df = result.get("temporal_reco_df", pd.DataFrame()).copy()
     ope_df = result.get("ope_df", pd.DataFrame()).copy()
 
-    # 关键数值
+    eligible_eval_df = result.get("eligible_eval_df", pd.DataFrame()).copy()
+    eligible_product_eval_df = result.get("eligible_product_eval_df", pd.DataFrame()).copy()
+    eligible_customer_reco_df = result.get("eligible_customer_reco_df", pd.DataFrame()).copy()
+    eligible_reco_empirical_eval_df = result.get("eligible_reco_empirical_eval_df", pd.DataFrame()).copy()
+    eligible_policy_gain_df = result.get("eligible_policy_gain_df", pd.DataFrame()).copy()
+    single_day_as_of_date_df = result.get("single_day_as_of_date", pd.DataFrame()).copy()
+
     n_rows = int(customer_reco_df.shape[0]) if not customer_reco_df.empty else 0
-    n_customers = (
-        int(customer_reco_df["cust_id"].nunique())
-        if ("cust_id" in customer_reco_df.columns and not customer_reco_df.empty)
-        else 0
-    )
-    n_products = (
-        int(product_eval_df["product_id"].nunique())
-        if ("product_id" in product_eval_df.columns and not product_eval_df.empty)
-        else 0
-    )
+    n_customers = int(customer_reco_df["cust_id"].nunique()) if ("cust_id" in customer_reco_df.columns and not customer_reco_df.empty) else 0
+    n_products = int(product_eval_df["product_id"].nunique()) if ("product_id" in product_eval_df.columns and not product_eval_df.empty) else 0
+
     if not product_eval_df.empty and "recommendation_decision" in product_eval_df.columns:
-        n_reco_products = int(
-            product_eval_df["recommendation_decision"].isin(["recommend_all", "recommend_targeted"]).sum()
-        )
+        n_reco_products = int(product_eval_df["recommendation_decision"].isin(["recommend_all", "recommend_targeted"]).sum())
         n_reco_products_all = int((product_eval_df["recommendation_decision"] == "recommend_all").sum())
         n_reco_products_targeted = int((product_eval_df["recommendation_decision"] == "recommend_targeted").sum())
     else:
@@ -91,15 +78,10 @@ def render_business_report_v3(
 
     reco_uplift = (
         float(reco_empirical_eval_df["empirical_uplift"].iloc[0])
-        if (
-            reco_empirical_eval_df is not None
-            and not reco_empirical_eval_df.empty
-            and "empirical_uplift" in reco_empirical_eval_df.columns
-        )
+        if (reco_empirical_eval_df is not None and not reco_empirical_eval_df.empty and "empirical_uplift" in reco_empirical_eval_df.columns)
         else np.nan
     )
 
-    # Top 产品表
     if not product_eval_df.empty:
         cols = [
             "product_id",
@@ -121,13 +103,10 @@ def render_business_report_v3(
             "pass_rate",
         ]
         cols = [c for c in cols if c in product_eval_df.columns]
-        prod_show = product_eval_df.sort_values(["recommendation_decision", "product_score"], ascending=[True, False])[
-            cols
-        ].head(top_products)
+        prod_show = product_eval_df.sort_values(["recommendation_decision", "product_score"], ascending=[True, False])[cols].head(top_products)
     else:
         prod_show = pd.DataFrame()
 
-    # 推荐明细（Top）
     if not customer_reco_df.empty:
         reco_cols = [
             "cust_id",
@@ -148,26 +127,10 @@ def render_business_report_v3(
     else:
         reco_show = pd.DataFrame()
 
-    policy_show = (
-        policy_gain_df
-        if (policy_gain_df is not None and not policy_gain_df.empty)
-        else pd.DataFrame(columns=["top_pct", "n", "uplift_gain"])
-    )
-    temporal_show = (
-        temporal_df
-        if (temporal_df is not None and not temporal_df.empty)
-        else pd.DataFrame(columns=["date", "model_ate", "empirical_uplift", "treated_n", "control_n"])
-    )
-    temporal_reco_show = (
-        temporal_reco_df
-        if (temporal_reco_df is not None and not temporal_reco_df.empty)
-        else pd.DataFrame(columns=["date", "reco_model_ate", "reco_empirical_uplift", "treated_n", "control_n"])
-    )
-    ope_show = (
-        ope_df
-        if (ope_df is not None and not ope_df.empty)
-        else pd.DataFrame(columns=["policy", "ipw_value", "dr_value", "ipw_ok", "dr_ok", "ipw_error", "dr_error"])
-    )
+    policy_show = policy_gain_df if (policy_gain_df is not None and not policy_gain_df.empty) else pd.DataFrame(columns=["top_pct", "n", "uplift_gain"])
+    temporal_show = temporal_df if (temporal_df is not None and not temporal_df.empty) else pd.DataFrame(columns=["date", "model_ate", "empirical_uplift", "treated_n", "control_n"])
+    temporal_reco_show = temporal_reco_df if (temporal_reco_df is not None and not temporal_reco_df.empty) else pd.DataFrame(columns=["date", "reco_model_ate", "reco_empirical_uplift", "treated_n", "control_n"])
+    ope_show = ope_df if (ope_df is not None and not ope_df.empty) else pd.DataFrame(columns=["policy", "ipw_value", "dr_value", "ipw_ok", "dr_ok", "ipw_error", "dr_error"])
 
     def _table(df: pd.DataFrame) -> str:
         if df is None or df.empty:
@@ -384,15 +347,47 @@ def render_business_report_v3(
         + "\n"
     )
 
-    md.append("## 六、离线策略价值评估（OPE）\n")
+    md.append("## 六、单日可推荐子集（线上投放口径）\n")
     md.append(
         "\n".join(
             [
-                "### 6.1 离线评估（OPE）在讲什么？",
+                "### 6.1 口径说明",
+                "- 该链路只在固定 `as_of_date` 上生成推荐，不对全量历史每天重复计算。",
+                "- eligible 规则：在 `[as_of_date - lookback_days, as_of_date - 1]` 内，`cust_id + product_id` 从未出现过 `T=1`，则视为可推荐。",
+                "- 该子集更贴近真实线上投放：只给近期未达标的客户推荐产品。",
+                "- 注意：单日子集可能没有真实 `T/Y`；若缺失，则只输出推荐清单，不做 treated/control uplift sanity check。",
+                "- `T` 在这里表示是否达标，`Y` 表示 `t~t+30` 的活期存款差额；不要把它误解成曝光/点击回流。",
+                "",
+                "### 6.2 当前单日配置",
+                f"- `as_of_date`：{_fmt(single_day_as_of_date_df.iloc[0]['as_of_date']) if not single_day_as_of_date_df.empty and 'as_of_date' in single_day_as_of_date_df.columns else '-'}",
+                f"- `lookback_days`：{_fmt(single_day_as_of_date_df.iloc[0]['lookback_days'], 0) if not single_day_as_of_date_df.empty and 'lookback_days' in single_day_as_of_date_df.columns else '-'}",
+                "",
+                "### 6.3 单日子集输出表",
+                "- `eligible_eval_df`：单日可推荐 eval 子集",
+                "- `eligible_product_eval_df`：单日子集上的产品评估",
+                "- `eligible_customer_reco_df`：单日子集上的客户推荐清单",
+                "- `eligible_reco_empirical_eval_df`：单日子集 treated-control uplift sanity check（若无 T/Y 则为空）",
+                "- `eligible_policy_gain_df`：单日子集策略收益曲线",
+                "",
+                "### 6.4 如何解读单日子集结果",
+                "- 若 eligible 样本数过少，单日结果波动会增大，需要适当调大 `lookback_days` 或检查数据覆盖。",
+                "- 若单日 `eligible_policy_gain_df` 在 top 小比例上仍明显为正，说明当天线上推荐的优先排序是有效的。",
+                "- 若单日子集与全量回测差异很大，通常说明全量中存在较多重复达标/无效样本，线上投放应优先参考单日子集。",
+                "",
+            ]
+        )
+        + "\n"
+    )
+
+    md.append("## 七、离线策略价值评估（OPE）\n")
+    md.append(
+        "\n".join(
+            [
+                "### 7.1 离线评估（OPE）在讲什么？",
                 "- 目的：在不能线上 A/B 的情况下，估计“如果按新策略触达，整体期望 Y 会是多少”。",
                 "- 说明：OPE 通常需要 `ps`（倾向得分）以及可能需要 `mu0/mu1`（潜在结果预测）。若缺列，本报告会在 `ope_df` 中说明原因。",
                 "",
-                "### 6.2 字段解释",
+                "### 7.2 字段解释",
                 "- `policy`：被评估的策略名称。",
                 "- `ipw_value`：IPW 估计的策略价值（需要 ps）。",
                 "- `dr_value`：DR 估计的策略价值（需要 ps + mu0/mu1）。",
@@ -404,7 +399,7 @@ def render_business_report_v3(
     )
     md.append(_table(ope_show) + "\n")
 
-    md.append("### 6.3 如何解读 OPE（若未计算可忽略）\n")
+    md.append("### 7.3 如何解读 OPE（若未计算可忽略）\n")
     md.append(
         "\n".join(
             [
@@ -416,16 +411,16 @@ def render_business_report_v3(
         + "\n"
     )
 
-    md.append("## 七、ps / mu0 / mu1 是什么？怎么计算？（给数据准备同学）\n")
+    md.append("## 八、ps / mu0 / mu1 是什么？怎么计算？（给数据准备同学）\n")
     md.append(
         "\n".join(
             [
-                "### 7.1 ps（propensity score，倾向得分）",
+                "### 8.1 ps（propensity score，倾向得分）",
                 "- 定义：ps(x) = P(T=1 | X=x)，即在历史策略下样本被触达/处理的概率。",
                 "- 用途：IPW/DR 等离线策略评估需要用 ps 来纠偏历史触达偏差。",
                 "- 计算：用历史数据训练一个二分类模型预测 T（特征只能用触达前可见特征），输出 predict_proba 的概率作为 ps，并进行 clipping（例如 0.01~0.99）。",
                 "",
-                "### 7.2 mu0 / mu1（潜在结果预测）",
+                "### 8.2 mu0 / mu1（潜在结果预测）",
                 "- 定义：mu0(x)=E[Y|X=x,T=0]，mu1(x)=E[Y|X=x,T=1]。",
                 "- 用途：DR（Doubly Robust）估计需要 mu0/mu1；只要 ps 或 mu 模型其中一个靠谱，估计仍可能一致。",
                 "- 计算（最简单 T-learner）：",
@@ -437,14 +432,14 @@ def render_business_report_v3(
         + "\n"
     )
 
-    md.append("## 八、配置参数与调参指南（Config & Tuning Guide）\n")
+    md.append("## 九、配置参数与调参指南（Config & Tuning Guide）\n")
     md.append(
         "\n".join(
             [
                 "本章节解释：产品门禁（哪些产品能推荐）、客户层输出（每个客户推荐什么）、安全控制（更保守/更激进）、以及排序权重（更偏个性化/更偏强产品/更偏安全）。",
                 "",
-                "### 8.0 本次运行参数快照（便于复现）",
-                "- 说明：以下参数来自本次运行时传入 `run_backtest_v3()` 的 config。不同业务可按目标调参。",
+                "### 9.0 本次运行参数快照（便于复现）",
+                "- 说明：以下参数来自本次运行时传入 `run_backtest_v3()` 的 config。",
                 "",
                 "#### ProductDecisionConfig",
                 f"- min_ate={_fmt(getattr(result.get('product_config', None), 'min_ate', None))}",
@@ -478,9 +473,7 @@ def render_business_report_v3(
                 f"- ps_clip_low={_fmt(getattr(result.get('backtest_config', None), 'ps_clip_low', None))}",
                 f"- ps_clip_high={_fmt(getattr(result.get('backtest_config', None), 'ps_clip_high', None))}",
                 "",
-                "说明：当前 v3 的 demo 入口里没有把 config 注入到 result 中；若你希望报告自动打印本次 config，我会在 v3 里把 config 对象一并放进 result（下方会实现）。",
-                "",
-                "### 8.1 产品门禁与决策参数（ProductDecisionConfig）怎么理解/怎么调？",
+                "### 9.1 产品门禁与决策参数（ProductDecisionConfig）怎么理解/怎么调？",
                 "- `min_ate`：ATE 下限。调大→更保守（产品池更小、平均效果更稳）；调小→更激进（覆盖更大、风险更高）。",
                 "- `min_empirical_uplift`：经验 uplift 下限。调大→更贴近历史真实结果、减少“模型幻觉”；调小→更多依赖模型 cate/排序能力。",
                 "- `min_qini` / `min_auuc`：排序能力门槛。调大→更强调“挑对人”（异质性强、定向价值高）；调小→更强调“平均有效”。",
@@ -494,20 +487,20 @@ def render_business_report_v3(
                 "- `allow_targeted_when_ate_negative`：允许 ATE<0 但 Top 很强的产品走 targeted。开→偏增长型；关→偏安全型。",
                 "- `enable_calibration`：是否用 empirical_uplift/ate 做尺度校准。开→更贴近历史结果口径；关→保持模型尺度（更稳定但可能与业务指标尺度不一致）。",
                 "",
-                "### 8.2 客户层输出参数（CustomerDecisionConfig）怎么理解/怎么调？",
+                "### 9.2 客户层输出参数（CustomerDecisionConfig）怎么理解/怎么调？",
                 "- `min_cate`：客户-产品对的 uplift 门槛。调大→只推更确定增益的组合；调小→推荐更多但平均增益可能下降。",
                 "- `top_k_per_customer`：每个客户最多推荐多少条。调大→覆盖更广但可能稀释；调小→更聚焦。",
                 "- `min_product_pass_rate`：产品门禁通过率阈值（当前 v3 未用于强过滤，属于预留；若要生效可加到 SQL WHERE）。",
                 "- `customer_weight_col`：客户权重列（当前 v3 未使用，预留）。",
                 "",
-                "### 8.3 安全与回测参数（SafetyConfig / BacktestConfig）怎么理解/怎么调？",
+                "### 9.3 安全与回测参数（SafetyConfig / BacktestConfig）怎么理解/怎么调？",
                 "- `enable_product_blacklist_gate`：是否仅从 recommend_all/targeted 产品池中做候选。一般建议开启（更可控）。",
                 "- `enable_customer_safe_filter` + `min_customer_expected_gain`：客户侧最低期望增益过滤。调大→更保守；调小→更激进。",
                 "- `max_customer_negative_share`：客户层负收益容忍度（当前 v3 未显式使用，预留）。",
                 "- `policy_bins`：policy curve 的切分点。更密→更细但更复杂；更稀→更易解释但粗糙。",
                 "- `ps_clip_low/high`：ps 裁剪范围（仅 OPE）。clip 更紧→权重更稳定但偏差可能增大；clip 更松→方差更大（易出现极端权重）。",
                 "",
-                "### 8.4 排序权重（最常用调参旋钮）怎么调？",
+                "### 9.4 排序权重（最常用调参旋钮）怎么调？",
                 "- 产品排序 `product_score` 有两套权重（mass vs targeted）：",
                 "  - 提高 `ate/empirical_uplift` 权重 → 更偏“平均收益更大”的产品",
                 "  - 提高 `qini/auuc/top_uplift_lift` 权重 → 更偏“更会挑人/异质性强”的产品",
@@ -522,14 +515,14 @@ def render_business_report_v3(
         + "\n"
     )
 
-    md.append("## 九、如何解读回测好坏（Interpretation Checklist）\n")
+    md.append("## 十、如何解读回测好坏（Interpretation Checklist）\n")
     md.append(
         "\n".join(
             [
                 "本项目的“回测”是离线验证：用模型的 uplift（`cate`）决定“推给谁”，再用历史数据中的 `T/Y` 做 sanity check 与策略收益模拟。",
                 "建议按 **必须过线 / 加分项 / 风险项** 三类信号来判断效果好坏。",
                 "",
-                "### 9.1 这套回测到底怎么测的？（口径说明）",
+                "### 10.1 这套回测到底怎么测的？（口径说明）",
                 "- **产品层（Product Level）**：对每个产品汇总 `cate` 得到 `ate`，并用历史 `T/Y` 计算 `empirical_uplift=mean(Y|T=1)-mean(Y|T=0)` 作为经验对照；再用 `cate` 排序构造 proxy 的 `qini/auuc/top_uplift_lift` 衡量“会不会挑人”。",
                 "- **客户层（Customer Level）**：在可推荐产品池中，对每个客户按 `recommend_score` 排序取 Top-K，形成推荐清单 `customer_reco_df`。",
                 "- **策略层（Policy Level）**：",
@@ -537,26 +530,26 @@ def render_business_report_v3(
                 "  - `temporal_df`：按日期观察 `model_ate` 与 `empirical_uplift` 是否稳定，排查漂移。",
                 "  - `ope_df`：当你提供 `ps/mu0/mu1` 时可做 IPW/DR 的离线策略评估（v3 默认不回读全量 parquet 做 OPE，因此会提示如何扩展）。",
                 "",
-                "### 9.2 必须过线（不然说明策略/模型基本不可用）",
+                "### 10.2 必须过线（不然说明策略/模型基本不可用）",
                 "1) **方向一致性**：进入推荐池（recommend_all/targeted）的产品，`ate` 与 `empirical_uplift` 不应长期大量反向。",
                 "   - 若大量出现 `ate>0` 但 `empirical_uplift<0`：优先排查数据泄露、标签口径、分布漂移、校准过强、或 treated/control 结构性差异。",
                 "2) **收益曲线形状**：`policy_gain_df.uplift_gain` 随 `top_pct` 增大应逐步下降并趋近 0；top 1%/2% 通常应明显高于 top 50%。",
                 "   - 若 top 很小比例仍不如整体：排序几乎无效（或推荐分与真实收益无关）。",
                 "3) **时间稳定性**：`temporal_df` 中 `empirical_uplift` 不应在样本量足够（treated_n/control_n 大）时出现断崖式变动。",
                 "",
-                "### 9.3 加分项（越多越好，说明更可上线）",
+                "### 10.3 加分项（越多越好，说明更可上线）",
                 "- 推荐池产品数量合理（不为 0，也不是几乎全量）。",
                 "- `negative_uplift_ratio` 低（更安全）。",
                 "- `top_uplift_lift`、`top_vs_rest_gap` 明显 > 0（说明模型“会挑人”，适合定向）。",
                 "- `reco_empirical_eval_df.empirical_uplift` 为正且量级符合业务预期（推荐清单子集的经验 uplift sanity check）。",
                 "",
-                "### 9.4 风险项（看到要警惕，通常需要调参/加门禁/重训）",
+                "### 10.4 风险项（看到要警惕，通常需要调参/加门禁/重训）",
                 "- `negative_uplift_ratio` 高但仍被推荐：门禁太松/安全权重太低。",
                 "- 小样本产品（sample_size/n_customer 很小）排到很前：可能噪声大，建议提高 `min_support_samples` 或加置信度判断。",
                 "- `empirical_uplift` 与 `ate` 偏离很大：考虑关闭/调整校准（enable_calibration）、或按业务口径重新训练模型。",
                 "- policy curve 不单调：考虑调整 `recommend_score` 权重、提高 `min_cate`、或把风险项权重调高。",
                 "",
-                "### 9.5 常用排查与调参建议（快速指引）",
+                "### 10.5 常用排查与调参建议（快速指引）",
                 "- **想更保守、更安全**：降低 `max_negative_uplift_ratio`、提高 `min_support_samples`、提高客户侧 `min_cate` / `min_customer_expected_gain`、提高推荐分里安全项权重。",
                 "- **想更激进、更覆盖**：放宽 `min_ate/min_empirical_uplift/min_qini`、降低 `min_cate`、提高 `top_k_per_customer`。",
                 "- **想更强调“挑人”能力（定向更尖）**：提高 `min_qini/min_auuc/min_top_uplift_lift`，并调小 `targeted_top_ratio`（只给最头部人群）。",
@@ -576,6 +569,11 @@ def render_business_report_v3(
                 "- `policy_gain_df`：不同触达比例下的收益曲线（经验口径）",
                 "- `temporal_df`：按 date 维度的 model_ate vs empirical_uplift（全量产品/全量样本）",
                 "- `temporal_reco_df`：按 date 维度的 reco_model_ate vs reco_empirical_uplift（仅推荐清单子集）",
+                "- `eligible_eval_df`：单日可推荐 eval 子集",
+                "- `eligible_product_eval_df`：单日子集上的产品评估",
+                "- `eligible_customer_reco_df`：单日子集上的客户推荐清单",
+                "- `eligible_reco_empirical_eval_df`：单日子集 treated-control uplift（sanity check）",
+                "- `eligible_policy_gain_df`：单日子集策略收益曲线",
                 "- `ope_df`：离线策略价值评估（若缺 ps/mu 会自动降级并写明原因）",
             ]
         )
@@ -595,10 +593,6 @@ def render_business_report_v3(
     return md_text
 
 
-# ============================================================
-# 与 v1/v2 保持一致的配置
-# ============================================================
-
 @dataclass
 class ProductDecisionConfig:
     min_ate: float = 0.0
@@ -607,13 +601,11 @@ class ProductDecisionConfig:
     min_top_uplift_lift: float = 0.0
     min_empirical_uplift: float = 0.0
     max_negative_uplift_ratio: float = 0.50
-
     enable_targeted_reco: bool = True
     targeted_top_ratio: float = 0.20
     min_targeted_top_cate: float = 0.5
     min_targeted_lift: float = 0.0
     allow_targeted_when_ate_negative: bool = True
-
     min_recommendable_customers: int = 100
     min_support_samples: int = 300
     top_ratio: float = 0.20
@@ -647,13 +639,6 @@ class BacktestConfig:
     random_state: int = 42
 
 
-REQUIRED_COLUMNS = ["cust_id", "product_id", "date", "cate", "T", "Y"]
-
-
-# ============================================================
-# DuckDB helpers
-# ============================================================
-
 def _duckdb_connect(db_path: Optional[str] = None):
     import duckdb
 
@@ -669,23 +654,12 @@ def _parquet_glob(parquet_dir: str) -> str:
 
 
 def get_parquet_columns(parquet_dir: str, duckdb_path: Optional[str] = None) -> List[str]:
-    """
-    读取 parquet schema，返回可用列名列表（小开销）。
-    注意：对 hive 分区列，duckdb 在 read_parquet(..., hive_partitioning=1) 后也会体现出来。
-    """
     con = _duckdb_connect(duckdb_path)
     glob = _parquet_glob(parquet_dir)
-    # LIMIT 0 只解析 schema
-    df = con.execute(
-        f"DESCRIBE SELECT * FROM read_parquet('{glob}', hive_partitioning=1) LIMIT 0;"
-    ).df()
+    df = con.execute(f"DESCRIBE SELECT * FROM read_parquet('{glob}', hive_partitioning=1) LIMIT 0;").df()
     con.close()
     return [str(x) for x in df["column_name"].tolist()]
 
-
-# ============================================================
-# v3：产品层评估（沿用 v2）
-# ============================================================
 
 def evaluate_products_duckdb(
     parquet_dir: str,
@@ -694,7 +668,6 @@ def evaluate_products_duckdb(
     duckdb_path: Optional[str] = None,
 ) -> pd.DataFrame:
     product_config = product_config or ProductDecisionConfig()
-
     con = _duckdb_connect(duckdb_path)
     glob = _parquet_glob(parquet_dir)
     con.execute(f"CREATE OR REPLACE VIEW eval AS SELECT * FROM read_parquet('{glob}', hive_partitioning=1);")
@@ -711,17 +684,11 @@ def evaluate_products_duckdb(
       QUANTILE_CONT(cate, 0.95) AS cate_p95,
       AVG(T) AS treated_rate,
       AVG(Y) AS outcome_rate,
-
       AVG(CASE WHEN T=1 THEN Y ELSE NULL END) AS treated_mean_outcome,
       AVG(CASE WHEN T=0 THEN Y ELSE NULL END) AS control_mean_outcome,
       SUM(CASE WHEN T=1 THEN 1 ELSE 0 END) AS treated_n,
       SUM(CASE WHEN T=0 THEN 1 ELSE 0 END) AS control_n,
-
-      AVG(CASE WHEN cate < 0 THEN 1 ELSE 0 END) AS negative_uplift_ratio,
-      CASE WHEN SUM(CASE WHEN T=1 THEN 1 ELSE 0 END) = 0 THEN 0.0
-           ELSE SUM(CASE WHEN T=1 AND cate < 0 THEN 1 ELSE 0 END) * 1.0
-              / SUM(CASE WHEN T=1 THEN 1 ELSE 0 END)
-      END AS treated_negative_uplift_ratio
+      AVG(CASE WHEN cate < 0 THEN 1 ELSE 0 END) AS negative_uplift_ratio
     FROM eval
     GROUP BY product_id
     """
@@ -797,17 +764,16 @@ def evaluate_products_duckdb(
 
     if external_metrics_df is not None and not external_metrics_df.empty:
         cols = [c for c in ["product_id", "qini", "auuc"] if c in external_metrics_df.columns]
-        product_eval = product_eval.drop(columns=["qini", "auuc"], errors="ignore")
-        product_eval = product_eval.merge(external_metrics_df[cols], on="product_id", how="left")
+        if cols:
+            product_eval = product_eval.drop(columns=["qini", "auuc"], errors="ignore")
+            product_eval = product_eval.merge(external_metrics_df[cols], on="product_id", how="left")
 
     if product_config.enable_calibration:
         product_eval["calibration_factor"] = product_eval.apply(
             lambda r: (r["empirical_uplift"] / r["ate"]) if (pd.notna(r["ate"]) and r["ate"] != 0) else 1.0,
             axis=1,
         )
-        product_eval["calibration_factor"] = (
-            product_eval["calibration_factor"].replace([np.inf, -np.inf], np.nan).fillna(1.0).clip(0.0, 5.0)
-        )
+        product_eval["calibration_factor"] = product_eval["calibration_factor"].replace([np.inf, -np.inf], np.nan).fillna(1.0).clip(0.0, 5.0)
     else:
         product_eval["calibration_factor"] = 1.0
 
@@ -818,16 +784,7 @@ def evaluate_products_duckdb(
     product_eval["pass_top_lift"] = product_eval["top_uplift_lift"] > product_config.min_top_uplift_lift
     product_eval["pass_negative_risk"] = product_eval["negative_uplift_ratio"] <= product_config.max_negative_uplift_ratio
     product_eval["pass_support"] = product_eval["sample_size"] >= product_config.min_support_samples
-
-    gate_cols = [
-        "pass_ate",
-        "pass_empirical",
-        "pass_qini",
-        "pass_auuc",
-        "pass_top_lift",
-        "pass_negative_risk",
-        "pass_support",
-    ]
+    gate_cols = ["pass_ate", "pass_empirical", "pass_qini", "pass_auuc", "pass_top_lift", "pass_negative_risk", "pass_support"]
     product_eval["pass_rate"] = product_eval[gate_cols].mean(axis=1)
 
     product_eval["pass_targeted"] = (
@@ -838,16 +795,8 @@ def evaluate_products_duckdb(
     )
 
     product_eval["recommendation_decision"] = np.select(
-        [
-            product_eval[gate_cols].all(axis=1),
-            product_eval["pass_targeted"],
-            product_eval["pass_ate"],
-        ],
-        [
-            "recommend_all",
-            "recommend_targeted",
-            "watchlist",
-        ],
+        [product_eval[gate_cols].all(axis=1), product_eval["pass_targeted"], product_eval["pass_ate"]],
+        ["recommend_all", "recommend_targeted", "watchlist"],
         default="reject",
     )
 
@@ -873,19 +822,11 @@ def evaluate_products_duckdb(
         + 0.20 * _normalize(product_eval["top_uplift_lift"])
         + 0.10 * (1 - _normalize(product_eval["negative_uplift_ratio"]))
     )
-    product_eval["product_score"] = np.where(
-        product_eval["recommendation_decision"] == "recommend_targeted",
-        score_targeted,
-        score_mass,
-    )
+    product_eval["product_score"] = np.where(product_eval["recommendation_decision"] == "recommend_targeted", score_targeted, score_mass)
 
     con.close()
     return product_eval.sort_values(["recommendation_decision", "product_score"], ascending=[True, False]).reset_index(drop=True)
 
-
-# ============================================================
-# v3：推荐生成（兼容缺列 ps/mu）
-# ============================================================
 
 def generate_recommendations_duckdb(
     parquet_dir: str,
@@ -895,11 +836,6 @@ def generate_recommendations_duckdb(
     product_config: Optional[ProductDecisionConfig] = None,
     duckdb_path: Optional[str] = None,
 ) -> pd.DataFrame:
-    """
-    v3：与 v2 相比，关键差异：
-    - 不假设 eval 表一定存在 ps/mu0/mu1
-    - 输出 df 中仍保留 ps/mu0/mu1 列（若源数据没有则为 NULL）
-    """
     customer_config = customer_config or CustomerDecisionConfig()
     safety_config = safety_config or SafetyConfig()
     product_config = product_config or ProductDecisionConfig()
@@ -908,7 +844,6 @@ def generate_recommendations_duckdb(
     glob = _parquet_glob(parquet_dir)
     con.execute(f"CREATE OR REPLACE VIEW eval AS SELECT * FROM read_parquet('{glob}', hive_partitioning=1);")
 
-    # 检测列存在性（避免 SQL 直接引用不存在列）
     cols = set(get_parquet_columns(parquet_dir, duckdb_path=duckdb_path))
     has_ps = "ps" in cols
     has_mu0 = "mu0" in cols
@@ -1027,10 +962,6 @@ def generate_recommendations_duckdb(
     return df
 
 
-# ============================================================
-# v3：policy curve / temporal（沿用 v2）
-# ============================================================
-
 def policy_gain_curve_duckdb(
     reco_df: pd.DataFrame,
     score_col: str,
@@ -1043,7 +974,6 @@ def policy_gain_curve_duckdb(
 
     con = _duckdb_connect(duckdb_path)
     con.register("reco", reco_df)
-
     global_mean = float(con.execute("SELECT AVG(Y) FROM reco").fetchone()[0])
 
     rows: List[Dict] = []
@@ -1051,7 +981,6 @@ def policy_gain_curve_duckdb(
     for b in bins:
         top_pct = float(b)
         k = max(1, int(np.ceil(n_total * top_pct)))
-
         if baseline_mode == "global_mean":
             uplift = float(con.execute(f"SELECT AVG(Y) FROM (SELECT * FROM reco ORDER BY {score_col} DESC LIMIT {k})").fetchone()[0]) - global_mean
         elif baseline_mode == "treated_control_in_top":
@@ -1059,15 +988,13 @@ def policy_gain_curve_duckdb(
                 con.execute(
                     f"""
                     WITH top AS (SELECT * FROM reco ORDER BY {score_col} DESC LIMIT {k})
-                    SELECT
-                      AVG(CASE WHEN T=1 THEN Y ELSE NULL END) - AVG(CASE WHEN T=0 THEN Y ELSE NULL END)
+                    SELECT AVG(CASE WHEN T=1 THEN Y ELSE NULL END) - AVG(CASE WHEN T=0 THEN Y ELSE NULL END)
                     FROM top
                     """
                 ).fetchone()[0]
             )
         else:
             raise ValueError(f"unknown baseline_mode: {baseline_mode}")
-
         rows.append({"top_pct": top_pct, "n": k, "uplift_gain": float(uplift)})
 
     con.close()
@@ -1075,14 +1002,9 @@ def policy_gain_curve_duckdb(
 
 
 def temporal_stability_duckdb(parquet_dir: str, duckdb_path: Optional[str] = None) -> pd.DataFrame:
-    """
-    全量时间稳定性（全量 eval 表，包含所有产品/样本）。
-    用于监控整体口径/数据漂移，可能会被大量“无效产品/无因果”稀释。
-    """
     con = _duckdb_connect(duckdb_path)
     glob = _parquet_glob(parquet_dir)
     con.execute(f"CREATE OR REPLACE VIEW eval AS SELECT * FROM read_parquet('{glob}', hive_partitioning=1);")
-
     sql = """
     WITH base AS (
       SELECT
@@ -1109,14 +1031,7 @@ def temporal_stability_duckdb(parquet_dir: str, duckdb_path: Optional[str] = Non
     return df
 
 
-def temporal_stability_reco_df(
-    customer_reco_df: pd.DataFrame,
-    score_col_for_model: str = "adjusted_cate",
-) -> pd.DataFrame:
-    """
-    推荐子集时间稳定性（只看最终输出的 customer_reco_df）。
-    用于回答“真正要上线触达的人群/产品池”在时间上的稳定性，避免被全量无效产品稀释。
-    """
+def temporal_stability_reco_df(customer_reco_df: pd.DataFrame, score_col_for_model: str = "adjusted_cate") -> pd.DataFrame:
     if customer_reco_df is None or customer_reco_df.empty:
         return pd.DataFrame(columns=["date", "reco_model_ate", "reco_empirical_uplift", "treated_n", "control_n"])
 
@@ -1124,25 +1039,23 @@ def temporal_stability_reco_df(
     if score_col_for_model not in d.columns:
         score_col_for_model = "cate" if "cate" in d.columns else d.columns[0]
 
-    g = d.groupby("date", dropna=False)
-    treated_mean = g.apply(lambda x: x.loc[x["T"] == 1, "Y"].mean())
-    control_mean = g.apply(lambda x: x.loc[x["T"] == 0, "Y"].mean())
+    grouped = d.groupby("date", dropna=False)
+    treated = d.loc[d["T"] == 1].groupby("date", dropna=False)["Y"].mean().rename("treated_mean")
+    control = d.loc[d["T"] == 0].groupby("date", dropna=False)["Y"].mean().rename("control_mean")
+    treated_n = d.assign(_is_treated=(d["T"] == 1).astype(int)).groupby("date", dropna=False)["_is_treated"].sum().rename("treated_n").astype(int)
+    control_n = d.assign(_is_control=(d["T"] == 0).astype(int)).groupby("date", dropna=False)["_is_control"].sum().rename("control_n").astype(int)
 
     out = pd.DataFrame(
         {
-            "date": treated_mean.index,
-            "reco_model_ate": g[score_col_for_model].mean().values,
-            "reco_empirical_uplift": (treated_mean - control_mean).values,
-            "treated_n": g.apply(lambda x: int((x["T"] == 1).sum())).values,
-            "control_n": g.apply(lambda x: int((x["T"] == 0).sum())).values,
+            "date": grouped.size().index,
+            "reco_model_ate": grouped[score_col_for_model].mean().values,
         }
-    )
-    return out.sort_values("date").reset_index(drop=True)
+    ).set_index("date")
+    out = out.join(treated, how="left").join(control, how="left").join(treated_n, how="left").join(control_n, how="left")
+    out["reco_empirical_uplift"] = out["treated_mean"] - out["control_mean"]
+    out = out.drop(columns=["treated_mean", "control_mean"])
+    return out.reset_index().sort_values("date").reset_index(drop=True)
 
-
-# ============================================================
-# v3：OPE（可选降级）
-# ============================================================
 
 def ope_ipw_policy_value(
     df: pd.DataFrame,
@@ -1187,9 +1100,48 @@ def build_policy_flag_top_pct(df: pd.DataFrame, score_col: str, top_pct: float) 
     return (order <= k).astype(int)
 
 
-# ============================================================
-# v3：主流程
-# ============================================================
+def _infer_latest_date(parquet_dir: str, duckdb_path: Optional[str] = None) -> Optional[str]:
+    con = _duckdb_connect(duckdb_path)
+    glob = _parquet_glob(parquet_dir)
+    con.execute(f"CREATE OR REPLACE VIEW eval AS SELECT * FROM read_parquet('{glob}', hive_partitioning=1);")
+    row = con.execute("SELECT CAST(MAX(date) AS VARCHAR) AS latest_date FROM eval").fetchone()
+    con.close()
+    return row[0] if row and row[0] is not None else None
+
+
+def build_eligible_eval_df(
+    parquet_dir: str,
+    as_of_date: str,
+    lookback_days: int = 30,
+    duckdb_path: Optional[str] = None,
+) -> pd.DataFrame:
+    con = _duckdb_connect(duckdb_path)
+    glob = _parquet_glob(parquet_dir)
+    con.execute(f"CREATE OR REPLACE VIEW eval AS SELECT * FROM read_parquet('{glob}', hive_partitioning=1);")
+    cols = set(get_parquet_columns(parquet_dir, duckdb_path=duckdb_path))
+    has_t = "T" in cols
+    sql = f"""
+    WITH history AS (
+      SELECT *
+      FROM eval
+      WHERE date < DATE '{as_of_date}'
+        AND date >= DATE '{as_of_date}' - INTERVAL {int(lookback_days)} DAY
+    ),
+    eligible_pairs AS (
+      SELECT cust_id, product_id
+      FROM history
+      GROUP BY cust_id, product_id
+      {"HAVING MAX(CASE WHEN T = 1 THEN 1 ELSE 0 END) = 0" if has_t else ""}
+    )
+    SELECT e.*
+    FROM eval e
+    INNER JOIN eligible_pairs p USING(cust_id, product_id)
+    WHERE e.date = DATE '{as_of_date}'
+    """
+    df = con.execute(sql).df()
+    con.close()
+    return df
+
 
 def run_backtest_v3(
     parquet_dir: str,
@@ -1199,6 +1151,9 @@ def run_backtest_v3(
     safety_config: Optional[SafetyConfig] = None,
     backtest_config: Optional[BacktestConfig] = None,
     duckdb_path: Optional[str] = None,
+    as_of_date: Optional[str] = None,
+    lookback_days: int = 30,
+    enable_single_day_reco: bool = False,
 ) -> Dict[str, pd.DataFrame]:
     product_config = product_config or ProductDecisionConfig()
     customer_config = customer_config or CustomerDecisionConfig()
@@ -1212,6 +1167,90 @@ def run_backtest_v3(
         duckdb_path=duckdb_path,
     )
 
+    single_day_result: Dict[str, pd.DataFrame] = {}
+    if enable_single_day_reco:
+        inferred_as_of_date = as_of_date or _infer_latest_date(parquet_dir, duckdb_path=duckdb_path)
+        if inferred_as_of_date is None:
+            eligible_eval_df = pd.DataFrame()
+            eligible_product_eval_df = pd.DataFrame()
+            eligible_customer_reco_df = pd.DataFrame()
+            eligible_reco_emp = pd.DataFrame()
+            eligible_policy_gain_df = pd.DataFrame()
+        else:
+            eligible_eval_df = build_eligible_eval_df(
+                parquet_dir=parquet_dir,
+                as_of_date=inferred_as_of_date,
+                lookback_days=lookback_days,
+                duckdb_path=duckdb_path,
+            )
+            if not eligible_eval_df.empty:
+                eligible_product_eval_df = evaluate_products_duckdb(
+                    parquet_dir=parquet_dir,
+                    product_config=product_config,
+                    external_metrics_df=external_metrics_df,
+                    duckdb_path=duckdb_path,
+                )
+                eligible_product_eval_df = eligible_product_eval_df[
+                    eligible_product_eval_df["product_id"].isin(eligible_eval_df["product_id"].unique())
+                ].reset_index(drop=True)
+            else:
+                eligible_product_eval_df = pd.DataFrame()
+
+            if not eligible_eval_df.empty and {"T", "Y"}.issubset(eligible_eval_df.columns):
+                treated_eligible = eligible_eval_df[eligible_eval_df["T"] == 1]
+                control_eligible = eligible_eval_df[eligible_eval_df["T"] == 0]
+                eligible_reco_emp = pd.DataFrame(
+                    [
+                        {
+                            "empirical_uplift": float(treated_eligible["Y"].mean() - control_eligible["Y"].mean()),
+                            "treated_n": int(len(treated_eligible)),
+                            "control_n": int(len(control_eligible)),
+                            "eval_available": True,
+                            "eval_reason": "T/Y available",
+                        }
+                    ]
+                )
+            else:
+                eligible_reco_emp = pd.DataFrame(
+                    [
+                        {
+                            "empirical_uplift": np.nan,
+                            "treated_n": np.nan,
+                            "control_n": np.nan,
+                            "eval_available": False,
+                            "eval_reason": "single-day eval skipped: missing T/Y",
+                        }
+                    ]
+                )
+
+            eligible_customer_reco_df = generate_recommendations_duckdb(
+                parquet_dir=parquet_dir,
+                product_eval_df=eligible_product_eval_df,
+                customer_config=customer_config,
+                safety_config=safety_config,
+                product_config=product_config,
+                duckdb_path=duckdb_path,
+            )
+            eligible_policy_gain_df = (
+                policy_gain_curve_duckdb(
+                    reco_df=eligible_customer_reco_df,
+                    score_col="recommend_score" if "recommend_score" in eligible_customer_reco_df.columns else "adjusted_cate",
+                    bins=backtest_config.policy_bins,
+                    baseline_mode="global_mean",
+                    duckdb_path=duckdb_path,
+                )
+                if not eligible_customer_reco_df.empty
+                else pd.DataFrame(columns=["top_pct", "n", "uplift_gain"])
+            )
+            single_day_result = {
+                "eligible_eval_df": eligible_eval_df,
+                "eligible_product_eval_df": eligible_product_eval_df,
+                "eligible_customer_reco_df": eligible_customer_reco_df,
+                "eligible_reco_empirical_eval_df": eligible_reco_emp,
+                "eligible_policy_gain_df": eligible_policy_gain_df,
+                "single_day_as_of_date": pd.DataFrame([{"as_of_date": inferred_as_of_date, "lookback_days": lookback_days}]),
+            }
+
     customer_reco_df = generate_recommendations_duckdb(
         parquet_dir=parquet_dir,
         product_eval_df=product_eval_df,
@@ -1221,143 +1260,5 @@ def run_backtest_v3(
         duckdb_path=duckdb_path,
     )
 
-    # 推荐子集 uplift（pandas 简算）
     if customer_reco_df.empty:
         reco_emp = pd.DataFrame([{"empirical_uplift": 0.0, "treated_n": 0, "control_n": 0}])
-    else:
-        treated = customer_reco_df[customer_reco_df["T"] == 1]
-        control = customer_reco_df[customer_reco_df["T"] == 0]
-        reco_emp = pd.DataFrame(
-            [
-                {
-                    "empirical_uplift": float(treated["Y"].mean() - control["Y"].mean()),
-                    "treated_mean_outcome": float(treated["Y"].mean()),
-                    "control_mean_outcome": float(control["Y"].mean()),
-                    "treated_n": int(len(treated)),
-                    "control_n": int(len(control)),
-                }
-            ]
-        )
-
-    policy_gain_df = policy_gain_curve_duckdb(
-        reco_df=customer_reco_df,
-        score_col="recommend_score" if "recommend_score" in customer_reco_df.columns else "adjusted_cate",
-        bins=backtest_config.policy_bins,
-        baseline_mode="global_mean",
-        duckdb_path=duckdb_path,
-    )
-
-    temporal_df = temporal_stability_duckdb(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
-    temporal_reco_df = temporal_stability_reco_df(customer_reco_df, score_col_for_model="adjusted_cate")
-
-    # OPE：根据列存在性降级
-    parquet_cols = set(get_parquet_columns(parquet_dir, duckdb_path=duckdb_path))
-    has_ps = "ps" in parquet_cols
-    has_mu0 = "mu0" in parquet_cols
-    has_mu1 = "mu1" in parquet_cols
-
-    # OPE 默认用 “全表 top20_by_cate” 的 policy 示例（与 v1 一致）
-    # 这里为了简单，不再从 parquet 读回全表（大数据），而是说明：OPE 要求全表策略 flag。
-    # 你如果后续要做 OPE，我们再扩展“在 DuckDB 上直接构造 policy_flag + 聚合计算”。
-    ope_rows: List[Dict] = []
-
-    if not has_ps:
-        ope_rows.append(
-            dict(
-                policy="top20_by_cate",
-                ipw_value=np.nan,
-                dr_value=np.nan,
-                ipw_ok=False,
-                dr_ok=False,
-                ipw_error="缺少 ps（propensity score），无法计算 IPW/DR OPE。可先跳过 OPE。",
-                dr_error="缺少 ps（propensity score），无法计算 IPW/DR OPE。可先跳过 OPE。",
-            )
-        )
-        ope_df = pd.DataFrame(ope_rows)
-    else:
-        # 仅在小数据场景下（或你愿意加载全表）才做 pandas OPE；v3 先提供“不会报错 + 明确提示”。
-        # 这里给出一个安全提示：默认不在 v3 中对超大 parquet 做全表回读。
-        if not (has_mu0 and has_mu1):
-            ope_rows.append(
-                dict(
-                    policy="top20_by_cate",
-                    ipw_value=np.nan,
-                    dr_value=np.nan,
-                    ipw_ok=False,
-                    dr_ok=False,
-                    ipw_error="检测到 ps，但 v3 默认不回读全量 parquet 做 OPE（大数据会很慢）。如需 OPE，可扩展 DuckDB 版本计算。",
-                    dr_error="缺少 mu0/mu1（或未启用全表 OPE 计算）。",
-                )
-            )
-        else:
-            ope_rows.append(
-                dict(
-                    policy="top20_by_cate",
-                    ipw_value=np.nan,
-                    dr_value=np.nan,
-                    ipw_ok=False,
-                    dr_ok=False,
-                    ipw_error="检测到 ps+mu0+mu1，但 v3 默认不回读全量 parquet 做 OPE。可扩展 DuckDB 版本计算。",
-                    dr_error="检测到 ps+mu0+mu1，但 v3 默认不回读全量 parquet 做 OPE。可扩展 DuckDB 版本计算。",
-                )
-            )
-
-        ope_df = pd.DataFrame(ope_rows)
-
-    return {
-        "product_eval_df": product_eval_df,
-        "customer_reco_df": customer_reco_df,
-        "reco_empirical_eval_df": reco_emp,
-        "policy_gain_df": policy_gain_df,
-        "temporal_df": temporal_df,
-        "temporal_reco_df": temporal_reco_df,
-        "ope_df": ope_df,
-        # 让报告可以打印“本次运行参数快照”（便于复现/对比调参效果）
-        "product_config": product_config,
-        "customer_config": customer_config,
-        "safety_config": safety_config,
-        "backtest_config": backtest_config,
-    }
-
-
-# ============================================================
-# Demo 入口：复用 v2 生成的 parquet（避免重复写）
-# ============================================================
-
-if __name__ == "__main__":
-    # 默认复用 v2 的 parquet 输出目录（你也可以改成你的真实 parquet）
-    parquet_dir = "backtest_output_v2/eval_parquet"
-
-    out_root = Path("backtest_output_v3")
-    out_root.mkdir(parents=True, exist_ok=True)
-
-    result = run_backtest_v3(
-        parquet_dir=parquet_dir,
-        external_metrics_df=None,
-        product_config=ProductDecisionConfig(
-            min_ate=0.0,
-            min_qini=0.0,
-            min_auuc=0.0,
-            min_top_uplift_lift=0.0,
-            min_empirical_uplift=0.0,
-            max_negative_uplift_ratio=0.4,
-            min_support_samples=300,
-            top_ratio=0.2,
-            enable_calibration=True,
-        ),
-        customer_config=CustomerDecisionConfig(min_cate=0.0, top_k_per_customer=3),
-        safety_config=SafetyConfig(max_customer_negative_share=0.4, min_customer_expected_gain=0.0),
-        backtest_config=BacktestConfig(),
-        duckdb_path=str(out_root / "duckdb_tmp.db"),
-    )
-
-    # 1) 落盘 csv
-    for k, df in result.items():
-        if isinstance(df, pd.DataFrame):
-            df.to_csv(out_root / f"{k}.csv", index=False)
-
-    # 2) 生成 md 报告
-    report_path = out_root / "backtest_report_v3.md"
-    render_business_report_v3(result, out_path=str(report_path), top_products=20, top_reco_rows=50)
-    print("v3 report saved to:", report_path)
-    print("v3 outputs saved to:", out_root)

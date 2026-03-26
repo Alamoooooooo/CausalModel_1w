@@ -1,2 +1,0 @@
-policy,ipw_value,dr_value,ipw_ok,dr_ok,ipw_error,dr_error
-top20_by_cate,,,False,False,检测到 ps+mu0+mu1，但 v3 默认不回读全量 parquet 做 OPE。可扩展 DuckDB 版本计算。,检测到 ps+mu0+mu1，但 v3 默认不回读全量 parquet 做 OPE。可扩展 DuckDB 版本计算。
