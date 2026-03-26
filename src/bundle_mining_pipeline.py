@@ -859,7 +859,7 @@ def build_bundle_eval_parquet_duckdb_debug(
 
 def run_bundle_mining_backtest_v3_debug(
     *,
-    single_parquet_dir: str = "backtest_output_v2/eval_parquet",
+    single_parquet_dir: str = "output/backtest_output_v2/eval_parquet",
     out_root: str = "backtest_output_bundle_v3",
     mining_cfg: Optional[BundleMiningConfig] = None,
     product_cfg_for_bundle: Optional[ProductDecisionConfig] = None,
@@ -1282,7 +1282,7 @@ def run_bundle_mining_prod_from_files(
 if __name__ == "__main__":
     # v3 Debug demo：从单产品 v3 eval parquet 生成 bundle parquet（cate=min 合成）并跑 v3 回测报告
     result = run_bundle_mining_backtest_v3_debug(
-        single_parquet_dir="backtest_output_v2/eval_parquet",
+        single_parquet_dir="output/backtest_output_v2/eval_parquet",
         out_root="backtest_output_bundle_v3",
         mining_cfg=BundleMiningConfig(
             and_mode=True,
@@ -1299,3 +1299,5 @@ if __name__ == "__main__":
     print("bundle_metrics:", result["bundle_metrics_df"].shape)
     print("bundle_parquet_dir:", result["bundle_parquet_dir"])
     print("report_path:", result["report_path"])
+
+
