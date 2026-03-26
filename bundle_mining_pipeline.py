@@ -931,6 +931,7 @@ def run_bundle_mining_backtest_v3_debug(
         safety_config=safety_cfg or SafetyConfig(min_customer_expected_gain=0.0),
         backtest_config=backtest_cfg or BacktestConfig(),
         duckdb_path=duckdb_path,
+        enable_single_day_reco=True,
     )
 
     # 4) synergy/incremental（小表 pandas merge）
@@ -1001,6 +1002,7 @@ def run_bundle_mining_backtest_v3_prod(
         safety_config=safety_cfg or SafetyConfig(),
         backtest_config=backtest_cfg or BacktestConfig(),
         duckdb_path=duckdb_path,
+        enable_single_day_reco=True,
     )
 
     report_path = os.path.join(out_root, "backtest_report_bundle_v3.md")

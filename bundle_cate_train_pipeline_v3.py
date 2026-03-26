@@ -112,14 +112,14 @@ def _assert_bundle_out_dir_safe(path: str, *, arg_name: str) -> None:
     固定约束：bundle 产物必须落在 backtest_output_bundle_v3/ 下。
 
     - 允许：backtest_output_bundle_v3 及其子目录
-    - 禁止：backtest_output_v2 / backtest_output_v3 / backtest_output/ / eval_parquet
+    - 禁止：backtest_output_v2 / backtest_output_v3 / backtest_output/
     """
     p = (path or "").replace("\\", "/").lower()
     if "backtest_output_bundle_v3" not in p:
         raise ValueError(
             f"[bundle-output-safety] {arg_name} must be under 'backtest_output_bundle_v3/'. Got: {path}"
         )
-    forbidden = ["backtest_output_v2", "backtest_output_v3", "backtest_output/", "/eval_parquet"]
+    forbidden = ["backtest_output_v2", "backtest_output_v3", "backtest_output/"]
     hit = [x for x in forbidden if x in p]
     if hit:
         raise ValueError(
@@ -184,6 +184,7 @@ def build_bundle_train_df_duckdb(
     SELECT * FROM base
     """
     con.execute("CREATE OR REPLACE TEMP VIEW merged AS " + sql)
+    con.execute("CREATE OR REPLACE TEMP VIEW merged_src AS SELECT * FROM merged")
 
     # join 其它产品的 T/Y
     for pid in bundle_products:
@@ -241,6 +242,9 @@ def build_bundle_train_df_duckdb(
     elif cfg.sample_frac is not None:
         # DuckDB 的 USING SAMPLE 支持 SYSTEM/BERNOULLI，这里用 BERNOULLI
         final_sql = f"SELECT * FROM ({final_sql}) USING SAMPLE BERNOULLI({float(cfg.sample_frac) * 100.0});"
+    # 额外防呆：不允许把单品 eval parquet 目录误用于 bundle 输出
+    _assert_bundle_out_dir_safe(cfg.out_bundle_parquet_dir, arg_name="cfg.out_bundle_parquet_dir")
+    # 保持与 bundle_mining_pipeline_v3 一致：bundle 输出目录必须是 bundle 根目录或其子目录
 
     df = con.execute(final_sql).df()
     con.close()

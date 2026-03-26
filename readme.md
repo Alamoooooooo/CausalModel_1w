@@ -1,7 +1,21 @@
-Q:
-我有一个新的项目需求：在对公客户中存在一部分客户出现了存款提升，业务想要我们去寻找存款提升的客户画像，并且找出是做了哪些产品（有一个产品池）导致客户存款提升的，挖掘其中的有效产品，并且再向无提升的用户推荐该有效产品。目前考虑是做用户画像及因果推理。请你帮我分析此项目需求。
-A:
-你提出的这个项目需求非常经典且具有很高的业务价值，它精准地抓住了对公业务从“粗放式管理”向“精细化运营”转型的核心。下面，我将结合你的思路，对项目进行系统性的分析，并提供一套可行的实施框架。
+# Bundle Mining Index
+
+如果你要看 **bundle（产品组合）因果挖掘** 的说明，请优先打开：
+
+- `bundle_mining_readme.md`
+
+本文件仅保留一个最小索引，避免与 bundle 专用说明混淆。
+
+## 相关脚本
+
+- `bundle_mining_pipeline.py`
+- `bundle_cate_train_pipeline_v3.py`
+- `backtest_full_pipeline_v3.py`
+
+## 说明
+
+- `bundle_mining_readme.md`：bundle 专用说明
+- `readme.md`：索引文件，不再承载详细流程说明
 
 ---
 
@@ -14,6 +28,8 @@ A:
 - **组合策略怎么推荐（先Base再Booster），怎么离线回测？**
 
 本仓库新增 `bundle_mining_pipeline.py`，用于在你现有 `backtest_full_pipeline.py` 基础上快速落地组合挖掘流程。
++
++> 补充：当前 bundle 流程已经同步到 `backtest_full_pipeline_v3.py`，并新增 `bundle_cate_train_pipeline_v3.py` 用于独立训练 bundle CATE 并产出 v3 兼容的 bundle eval parquet。
 
 ## 1. 输入数据（沿用现有 long-format）
 
@@ -72,6 +88,11 @@ python bundle_mining_pipeline.py
 - `backtest_output_bundle_v3/eval_parquet_bundle/`（hive 分区 `product_id=bundle_id`）
 - `backtest_output_bundle_v3/backtest_report_bundle_v3.md`
 - `backtest_output_bundle_v3/backtest_report_bundle_v3_gbk.md`
++
++补充说明：
++- `backtest_full_pipeline_v3.py` 新增了 `eligible_*` 单日子集输出，以及 `single_day_as_of_date`
++- bundle debug / prod 回测入口已同步启用 `enable_single_day_reco=True`
++- bundle 训练与回测的输出目录都带防呆，避免误写到 `backtest_output_v2/` 或 `backtest_output_v3/`
 
 安全约束：
 - bundle 相关入口会做“防呆校验”：**禁止把 bundle 输出目录指向 `backtest_output_v2/`、`backtest_output_v3/`、`backtest_output/` 或单品的 `eval_parquet/`**；
@@ -120,6 +141,18 @@ v3 生产建议拆成两步（训练/评估解耦，适合大数据调度）：
 - 使用新脚本：`bundle_cate_train_pipeline_v3.py`
 - 输入：`per_product_data/` 下的每产品文件（`cust_id,date,X...,T,Y`）
 - 输出：`backtest_output_bundle_v3/eval_parquet_bundle/`（hive 分区）
++
++建议训练入口：
++```python
++from bundle_cate_train_pipeline_v3 import BundleTrainJobConfig, train_one_bundle_and_write_eval
++
++cfg = BundleTrainJobConfig(
++    per_product_data_dir="per_product_data",
++    per_product_file_format="parquet",
++    feature_cols=["x1", "x2", "x3"],
++)
++train_one_bundle_and_write_eval(bundle_products=["1", "2"], base_product="1", cfg=cfg)
++```
 
 **Step2：评估并出报告**
 ```python

@@ -347,37 +347,38 @@ def render_business_report_v3(
         + "\n"
     )
 
-    md.append("## 六、单日可推荐子集（线上投放口径）\n")
-    md.append(
-        "\n".join(
-            [
-                "### 6.1 口径说明",
-                "- 该链路只在固定 `as_of_date` 上生成推荐，不对全量历史每天重复计算。",
-                "- eligible 规则：在 `[as_of_date - lookback_days, as_of_date - 1]` 内，`cust_id + product_id` 从未出现过 `T=1`，则视为可推荐。",
-                "- 该子集更贴近真实线上投放：只给近期未达标的客户推荐产品。",
-                "- 注意：单日子集可能没有真实 `T/Y`；若缺失，则只输出推荐清单，不做 treated/control uplift sanity check。",
-                "- `T` 在这里表示是否达标，`Y` 表示 `t~t+30` 的活期存款差额；不要把它误解成曝光/点击回流。",
-                "",
-                "### 6.2 当前单日配置",
-                f"- `as_of_date`：{_fmt(single_day_as_of_date_df.iloc[0]['as_of_date']) if not single_day_as_of_date_df.empty and 'as_of_date' in single_day_as_of_date_df.columns else '-'}",
-                f"- `lookback_days`：{_fmt(single_day_as_of_date_df.iloc[0]['lookback_days'], 0) if not single_day_as_of_date_df.empty and 'lookback_days' in single_day_as_of_date_df.columns else '-'}",
-                "",
-                "### 6.3 单日子集输出表",
-                "- `eligible_eval_df`：单日可推荐 eval 子集",
-                "- `eligible_product_eval_df`：单日子集上的产品评估",
-                "- `eligible_customer_reco_df`：单日子集上的客户推荐清单",
-                "- `eligible_reco_empirical_eval_df`：单日子集 treated-control uplift sanity check（若无 T/Y 则为空）",
-                "- `eligible_policy_gain_df`：单日子集策略收益曲线",
-                "",
-                "### 6.4 如何解读单日子集结果",
-                "- 若 eligible 样本数过少，单日结果波动会增大，需要适当调大 `lookback_days` 或检查数据覆盖。",
-                "- 若单日 `eligible_policy_gain_df` 在 top 小比例上仍明显为正，说明当天线上推荐的优先排序是有效的。",
-                "- 若单日子集与全量回测差异很大，通常说明全量中存在较多重复达标/无效样本，线上投放应优先参考单日子集。",
-                "",
-            ]
+    if not eligible_eval_df.empty or not eligible_customer_reco_df.empty or not eligible_policy_gain_df.empty:
+        md.append("## 六、单日可推荐子集（线上投放口径）\n")
+        md.append(
+            "\n".join(
+                [
+                    "### 6.1 口径说明",
+                    "- 该链路只在固定 `as_of_date` 上生成推荐，不对全量历史每天重复计算。",
+                    "- eligible 规则：在 `[as_of_date - lookback_days, as_of_date - 1]` 内，`cust_id + product_id` 从未出现过 `T=1`，则视为可推荐。",
+                    "- 该子集更贴近真实线上投放：只给近期未达标的客户推荐产品。",
+                    "- 注意：单日子集可能没有真实 `T/Y`；若缺失，则只输出推荐清单，不做 treated/control uplift sanity check。",
+                    "- `T` 在这里表示是否达标，`Y` 表示 `t~t+30` 的活期存款差额；不要把它误解成曝光/点击回流。",
+                    "",
+                    "### 6.2 当前单日配置",
+                    f"- `as_of_date`：{_fmt(single_day_as_of_date_df.iloc[0]['as_of_date']) if not single_day_as_of_date_df.empty and 'as_of_date' in single_day_as_of_date_df.columns else '-'}",
+                    f"- `lookback_days`：{_fmt(single_day_as_of_date_df.iloc[0]['lookback_days'], 0) if not single_day_as_of_date_df.empty and 'lookback_days' in single_day_as_of_date_df.columns else '-'}",
+                    "",
+                    "### 6.3 单日子集输出表",
+                    "- `eligible_eval_df`：单日可推荐 eval 子集",
+                    "- `eligible_product_eval_df`：单日子集上的产品评估",
+                    "- `eligible_customer_reco_df`：单日子集上的客户推荐清单",
+                    "- `eligible_reco_empirical_eval_df`：单日子集 treated-control uplift sanity check（若无 T/Y 则为空）",
+                    "- `eligible_policy_gain_df`：单日子集策略收益曲线",
+                    "",
+                    "### 6.4 如何解读单日子集结果",
+                    "- 若 eligible 样本数过少，单日结果波动会增大，需要适当调大 `lookback_days` 或检查数据覆盖。",
+                    "- 若单日 `eligible_policy_gain_df` 在 top 小比例上仍明显为正，说明当天线上推荐的优先排序是有效的。",
+                    "- 若单日子集与全量回测差异很大，通常说明全量中存在较多重复达标/无效样本，线上投放应优先参考单日子集。",
+                    "",
+                ]
+            )
+            + "\n"
         )
-        + "\n"
-    )
 
     md.append("## 七、离线策略价值评估（OPE）\n")
     md.append(
@@ -1154,6 +1155,7 @@ def run_backtest_v3(
     as_of_date: Optional[str] = None,
     lookback_days: int = 30,
     enable_single_day_reco: bool = False,
+    mode: str = "both",
 ) -> Dict[str, pd.DataFrame]:
     product_config = product_config or ProductDecisionConfig()
     customer_config = customer_config or CustomerDecisionConfig()
@@ -1168,7 +1170,9 @@ def run_backtest_v3(
     )
 
     single_day_result: Dict[str, pd.DataFrame] = {}
-    if enable_single_day_reco:
+    run_full = mode in {"full", "both"}
+    run_single_day = mode in {"single_day", "both"} and enable_single_day_reco
+    if run_single_day:
         inferred_as_of_date = as_of_date or _infer_latest_date(parquet_dir, duckdb_path=duckdb_path)
         if inferred_as_of_date is None:
             eligible_eval_df = pd.DataFrame()
@@ -1251,14 +1255,220 @@ def run_backtest_v3(
                 "single_day_as_of_date": pd.DataFrame([{"as_of_date": inferred_as_of_date, "lookback_days": lookback_days}]),
             }
 
-    customer_reco_df = generate_recommendations_duckdb(
-        parquet_dir=parquet_dir,
-        product_eval_df=product_eval_df,
-        customer_config=customer_config,
-        safety_config=safety_config,
-        product_config=product_config,
-        duckdb_path=duckdb_path,
+    customer_reco_df = (
+        generate_recommendations_duckdb(
+            parquet_dir=parquet_dir,
+            product_eval_df=product_eval_df,
+            customer_config=customer_config,
+            safety_config=safety_config,
+            product_config=product_config,
+            duckdb_path=duckdb_path,
+        )
+        if run_full
+        else pd.DataFrame()
     )
 
-    if customer_reco_df.empty:
+    if not run_full:
+        reco_emp = pd.DataFrame(columns=["empirical_uplift", "treated_n", "control_n"])
+        policy_gain_df = pd.DataFrame(columns=["top_pct", "n", "uplift_gain"])
+        temporal_df = pd.DataFrame(columns=["date", "model_ate", "empirical_uplift", "treated_n", "control_n"])
+        temporal_reco_df = pd.DataFrame(columns=["date", "reco_model_ate", "reco_empirical_uplift", "treated_n", "control_n"])
+        ope_df = pd.DataFrame(columns=["policy", "ipw_value", "dr_value", "ipw_ok", "dr_ok", "ipw_error", "dr_error"])
+    elif customer_reco_df.empty:
         reco_emp = pd.DataFrame([{"empirical_uplift": 0.0, "treated_n": 0, "control_n": 0}])
+    else:
+        treated = customer_reco_df[customer_reco_df["T"] == 1]
+        control = customer_reco_df[customer_reco_df["T"] == 0]
+        reco_emp = pd.DataFrame(
+            [
+                {
+                    "empirical_uplift": float(treated["Y"].mean() - control["Y"].mean()),
+                    "treated_mean_outcome": float(treated["Y"].mean()),
+                    "control_mean_outcome": float(control["Y"].mean()),
+                    "treated_n": int(len(treated)),
+                    "control_n": int(len(control)),
+                }
+            ]
+        )
+
+    if run_full:
+        policy_gain_df = policy_gain_curve_duckdb(
+            reco_df=customer_reco_df,
+            score_col="recommend_score" if "recommend_score" in customer_reco_df.columns else "adjusted_cate",
+            bins=backtest_config.policy_bins,
+            baseline_mode="global_mean",
+            duckdb_path=duckdb_path,
+        )
+        temporal_df = temporal_stability_duckdb(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
+        temporal_reco_df = temporal_stability_reco_df(customer_reco_df, score_col_for_model="adjusted_cate")
+        ope_df = pd.DataFrame(columns=["policy", "ipw_value", "dr_value", "ipw_ok", "dr_ok", "ipw_error", "dr_error"])
+    else:
+        policy_gain_df = pd.DataFrame(columns=["top_pct", "n", "uplift_gain"])
+        temporal_df = pd.DataFrame(columns=["date", "model_ate", "empirical_uplift", "treated_n", "control_n"])
+        temporal_reco_df = pd.DataFrame(columns=["date", "reco_model_ate", "reco_empirical_uplift", "treated_n", "control_n"])
+        ope_df = pd.DataFrame(columns=["policy", "ipw_value", "dr_value", "ipw_ok", "dr_ok", "ipw_error", "dr_error"])
+
+    result = {
+        "product_eval_df": product_eval_df if run_full else pd.DataFrame(),
+        "customer_reco_df": customer_reco_df,
+        "reco_empirical_eval_df": reco_emp,
+        "policy_gain_df": policy_gain_df,
+        "temporal_df": temporal_df,
+        "temporal_reco_df": temporal_reco_df,
+        "ope_df": ope_df,
+    }
+    result.update(single_day_result)
+    result["product_config"] = product_config
+    result["customer_config"] = customer_config
+    result["safety_config"] = safety_config
+    result["backtest_config"] = backtest_config
+    return result
+
+
+def main() -> None:
+    import argparse
+    import shutil
+
+    # CLI 入口说明：
+    # - 这是 backtest_full_pipeline_v3.py 的脚本入口，用于直接执行回测流程。
+    # - --mode 控制执行场景：
+    #   * full：仅跑全量回测，生成产品层/客户层/策略层输出。
+    #   * single_day：仅跑单日可推荐子集，适合检查某个 as_of_date 的线上投放口径。
+    #   * both：同时跑 full + single_day。
+    # - --out_dir 指定输出根目录；每个 case 会在其子目录下输出 csv、DuckDB 临时库和 md 报告。
+    # - --run_tests 不是单元测试，而是按顺序执行多个可执行场景，便于一键回归。
+    parser = argparse.ArgumentParser(description="Backtest full pipeline v3")
+    parser.add_argument("--mode", choices=["full", "single_day", "both"], default="both")
+    parser.add_argument("--parquet_dir", default="backtest_output_v2/eval_parquet")
+    parser.add_argument("--out_dir", default="backtest_output_v3")
+    parser.add_argument("--as_of_date", default=None)
+    parser.add_argument("--lookback_days", type=int, default=30)
+    parser.add_argument("--enable_single_day_reco", action="store_true")
+    parser.add_argument("--run_tests", action="store_true")
+    args = parser.parse_args()
+
+    out_root = Path(args.out_dir)
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    def _save_result(result: Dict[str, pd.DataFrame], target_dir: Path) -> None:
+        # 将回测结果落盘到 case 目录：
+        # - 每个 DataFrame 单独保存为 CSV
+        # - 同时生成 v3 Markdown 报告，便于人工查看回测结论
+        target_dir.mkdir(parents=True, exist_ok=True)
+        for k, df in result.items():
+            if isinstance(df, pd.DataFrame):
+                df.to_csv(target_dir / f"{k}.csv", index=False)
+        report_path = target_dir / "backtest_report_v3.md"
+        render_business_report_v3(result, out_path=str(report_path), top_products=20, top_reco_rows=50)
+        print("v3 report saved to:", report_path)
+        print("v3 outputs saved to:", target_dir)
+
+    def _run_case(case_name: str, **kwargs) -> Dict[str, pd.DataFrame]:
+        # 执行一个独立场景（例如 test_single_day / test_full / test_both）。
+        # 每个场景都使用独立输出目录和独立 DuckDB 临时库，互不干扰。
+        case_dir = out_root / case_name
+        if case_dir.exists():
+            try:
+                shutil.rmtree(case_dir)
+            except PermissionError:
+                for p in case_dir.glob("**/*"):
+                    if p.is_file():
+                        try:
+                            p.unlink()
+                        except PermissionError:
+                            pass
+                for p in sorted([p for p in case_dir.glob("**/*") if p.is_dir()], reverse=True):
+                    try:
+                        p.rmdir()
+                    except OSError:
+                        pass
+                try:
+                    case_dir.rmdir()
+                except OSError:
+                    pass
+        case_dir.mkdir(parents=True, exist_ok=True)
+        result = run_backtest_v3(
+            parquet_dir=args.parquet_dir,
+            external_metrics_df=None,
+            product_config=ProductDecisionConfig(
+                min_ate=0.0,
+                min_qini=0.0,
+                min_auuc=0.0,
+                min_top_uplift_lift=0.0,
+                min_empirical_uplift=0.0,
+                max_negative_uplift_ratio=0.4,
+                min_support_samples=300,
+                top_ratio=0.2,
+                enable_calibration=True,
+            ),
+            customer_config=CustomerDecisionConfig(min_cate=0.0, top_k_per_customer=3),
+            safety_config=SafetyConfig(max_customer_negative_share=0.4, min_customer_expected_gain=0.0),
+            backtest_config=BacktestConfig(),
+            duckdb_path=str(case_dir / "duckdb_tmp.db"),
+            **kwargs,
+        )
+        _save_result(result, case_dir)
+        return result
+
+    if args.run_tests:
+        # 一键回归入口：顺序执行多个可执行场景，不做单元测试式断言。
+        print("[RUN] Executing single_day case...")
+        _run_case(
+            "test_single_day",
+            as_of_date=args.as_of_date,
+            lookback_days=args.lookback_days,
+            enable_single_day_reco=True,
+            mode="single_day",
+        )
+
+        print("[RUN] Executing full case...")
+        _run_case(
+            "test_full",
+            as_of_date=args.as_of_date,
+            lookback_days=args.lookback_days,
+            enable_single_day_reco=False,
+            mode="full",
+        )
+
+        print("[RUN] Executing both case...")
+        _run_case(
+            "test_both",
+            as_of_date=args.as_of_date,
+            lookback_days=args.lookback_days,
+            enable_single_day_reco=True,
+            mode="both",
+        )
+
+        print("[RUN] All cases finished.")
+        return
+
+    # 单场景直接执行入口：根据 --mode / --enable_single_day_reco 运行一次回测并输出到 out_dir。
+    result = run_backtest_v3(
+        parquet_dir=args.parquet_dir,
+        external_metrics_df=None,
+        product_config=ProductDecisionConfig(
+            min_ate=0.0,
+            min_qini=0.0,
+            min_auuc=0.0,
+            min_top_uplift_lift=0.0,
+            min_empirical_uplift=0.0,
+            max_negative_uplift_ratio=0.4,
+            min_support_samples=300,
+            top_ratio=0.2,
+            enable_calibration=True,
+        ),
+        customer_config=CustomerDecisionConfig(min_cate=0.0, top_k_per_customer=3),
+        safety_config=SafetyConfig(max_customer_negative_share=0.4, min_customer_expected_gain=0.0),
+        backtest_config=BacktestConfig(),
+        duckdb_path=str(out_root / "duckdb_tmp.db"),
+        as_of_date=args.as_of_date,
+        lookback_days=args.lookback_days,
+        enable_single_day_reco=(args.enable_single_day_reco or args.mode in {"single_day", "both"}),
+        mode=args.mode,
+    )
+
+    _save_result(result, out_root)
+
+
+if __name__ == "__main__":
+    main()
