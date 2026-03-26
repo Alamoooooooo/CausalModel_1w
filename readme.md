@@ -57,71 +57,84 @@ A:
 - `overlap_ratio_top`：Top uplift 客群重叠率（高说明冗余，低说明互补）
 - `incremental_to_base = ATE(bundle) - ATE(base)`（仅 Base+Booster 组合）
 
-## 5. 快速跑 demo（Debug）
+## 5. 快速跑 demo（Debug, v3 DuckDB + Parquet）
+
+> 注意：当前 `bundle_mining_pipeline.py` 的 `__main__` 已切换为 v3 debug demo：
+> - 会从“单产品 eval parquet（hive 分区）”构造 bundle eval parquet
+> - debug 口径：`cate_bundle = min(cate_i)`
+> - 再调用 `backtest_full_pipeline_v3.run_backtest_v3()` 输出 bundle 报告
 
 ```bash
 python bundle_mining_pipeline.py
 ```
 
-会在模拟数据上输出：
+输出目录（与单品输出严格隔离，避免覆盖）：
+- `backtest_output_bundle_v3/eval_parquet_bundle/`（hive 分区 `product_id=bundle_id`）
+- `backtest_output_bundle_v3/backtest_report_bundle_v3.md`
+- `backtest_output_bundle_v3/backtest_report_bundle_v3_gbk.md`
 
-- `bundle_candidates` shape
-- `bundle_product_eval` shape
-- `bundle_product_eval_df` 的前几行（含 ate / synergy / overlap）
+安全约束：
+- bundle 相关入口会做“防呆校验”：**禁止把 bundle 输出目录指向 `backtest_output_v2/`、`backtest_output_v3/`、`backtest_output/` 或单品的 `eval_parquet/`**；
+- 一旦检测到疑似单品目录，会直接抛错拒绝写入，防止覆盖/污染原单品回测产物。
 
-## 6. 两条入口（Debug vs Prod）
+## 6. 两条入口（Debug vs Prod, v3）
 
-### 6.1 Debug / 研究入口（依赖 eval_df 长表）
-用于快速跑通流程与调试组合逻辑（可用单品 cate 合成 bundle cate）。
+v3 推荐使用以下两个入口（都复用 `backtest_full_pipeline_v3.py`）：
 
-输入 `eval_df`（长表）至少包含：
-- `cust_id, product_id, date, T, Y`
-- 若要计算 `overlap_ratio_top` 或合成 bundle cate，还需要 `cate`
+- Debug：`run_bundle_mining_backtest_v3_debug(...)`
+  - 输入：单产品 eval parquet（hive 分区）
+  - 产出：bundle eval parquet + bundle v3 报告
+- Prod：`run_bundle_mining_backtest_v3_prod(...)`
+  - 输入：你训练/推理后产出的 bundle eval parquet（hive 分区）
+  - 产出：bundle v3 报告
+
+### 6.1 Debug / 研究入口（v3，推荐：单产品 parquet → bundle parquet → run_backtest_v3）
+
+输入：
+- `single_parquet_dir`：单产品 eval parquet 根目录（hive 分区 `product_id=...`）
+  - 目前 demo 默认：`backtest_output_v2/eval_parquet`
+  - 你真实生产可改成：`backtest_output_v3/eval_parquet`（确保目录存在且包含 `*.parquet`）
 
 示例：
 ```python
-from bundle_mining_pipeline import BundleMiningConfig, BundleTrainConfig, run_bundle_mining_backtest
+from bundle_mining_pipeline import BundleMiningConfig, run_bundle_mining_backtest_v3_debug
 
-result = run_bundle_mining_backtest(
-    eval_df=eval_df,
-    product_eval_df=product_eval_df,  # 单品 backtest 得到的 product_eval_df（含 recommendation_decision/product_score）
+result = run_bundle_mining_backtest_v3_debug(
+    single_parquet_dir="backtest_output_v2/eval_parquet",
+    out_root="backtest_output_bundle_v3",
     mining_cfg=BundleMiningConfig(top_n_base=6, top_n_booster=6, min_bundle_support_rows=300),
-    train_cfg=BundleTrainConfig(mode="debug"),
-    synthesize_cate_mode="min",       # min/mean/sum
+    cate_mode="min",  # min/mean/sum
+    duckdb_path="backtest_output_bundle_v3/duckdb_tmp.db",
 )
-```
-
-### 6.2 Prod / 生产入口（完全从每产品 feature_df 文件取数）
-用于“重新训练 bundle 模型并推理 cate_bundle”，不依赖 eval_df。
-
-每个产品一个文件，粒度为 `cust_id,date`，包含：
-- `cust_id, date, X..., T, Y`
-
-示例：
-```python
-from bundle_mining_pipeline import BundleMiningConfig, BundleTrainConfig, run_bundle_mining_prod_from_files
-
-result = run_bundle_mining_prod_from_files(
-    product_eval_df=product_eval_df,  # 单品评估产物，用于生成组合候选
-    mining_cfg=BundleMiningConfig(top_n_base=8, top_n_booster=8, min_bundle_support_rows=500),
-    train_cfg=BundleTrainConfig(
-        mode="prod",
-        per_product_data_dir=r"你的单产品文件目录",
-        per_product_file_pattern="{product_id}.parquet",
-        per_product_file_format="parquet",
-        feature_cols=["x1", "x2", "x3"],  # 你的特征列名列表
-        t_col="T",
-        y_col="Y",
-        artifacts_dir="bundle_artifacts",
-        force_retrain=False,
-        learner_params={"n_estimators": 200, "min_samples_leaf": 50, "n_jobs": -1},
-    ),
-)
+print(result["report_path"])
 ```
 
 说明：
-- prod 模式会在 `bundle_artifacts/{bundle_id}/` 下缓存 `cate.parquet` 与 `drlearner_model.pkl`；若缓存存在且 `force_retrain=False` 会直接复用。
-- prod 模式默认按 AND 定义 `T_bundle = min(T_i)`。
+- debug 的 `cate_bundle` 为合成口径，只用于研究/联调，不用于上线。
+
+### 6.2 Prod / 生产入口（v3，推荐：先训练产出 bundle parquet，再评估）
+
+v3 生产建议拆成两步（训练/评估解耦，适合大数据调度）：
+
+**Step1：训练并产出 bundle eval parquet**
+- 使用新脚本：`bundle_cate_train_pipeline_v3.py`
+- 输入：`per_product_data/` 下的每产品文件（`cust_id,date,X...,T,Y`）
+- 输出：`backtest_output_bundle_v3/eval_parquet_bundle/`（hive 分区）
+
+**Step2：评估并出报告**
+```python
+from bundle_mining_pipeline import run_bundle_mining_backtest_v3_prod
+
+result = run_bundle_mining_backtest_v3_prod(
+    bundle_parquet_dir="backtest_output_bundle_v3/eval_parquet_bundle",
+    out_root="backtest_output_bundle_v3",
+    duckdb_path="backtest_output_bundle_v3/duckdb_tmp.db",
+)
+print(result["report_path"])
+```
+
+说明：
+- 旧的 `run_bundle_mining_prod_from_files(...)` 已不再推荐（它是 pandas + legacy backtest 形态），目前会直接抛出提示你走 v3 两步法。
 
 ## 7. 关键函数速查（定义 + 作用）
 

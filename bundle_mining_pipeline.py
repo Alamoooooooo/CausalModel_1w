@@ -39,15 +39,16 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
-# 复用你现有的“整理版完整回测 pipeline”
-# 该文件在仓库根目录：backtest_full_pipeline.py
-from backtest_full_pipeline import (  # noqa: F401
+# 复用 v3：Parquet + DuckDB 大数据回测 pipeline
+# 该文件在仓库根目录：backtest_full_pipeline_v3.py
+from backtest_full_pipeline_v3 import (  # noqa: F401
     BacktestConfig,
     CustomerDecisionConfig,
     ProductDecisionConfig,
     SafetyConfig,
-    run_backtest,
-    validate_eval_df,
+    evaluate_products_duckdb,
+    render_business_report_v3,
+    run_backtest_v3,
 )
 
 # 可选：生产训练依赖（causalml）
@@ -255,17 +256,9 @@ def build_bundle_eval_df_and_mode(
     min_bundle_support_rows: int = 0,
 ) -> pd.DataFrame:
     """
-    AND 模式：T_bundle=1 当且仅当 bundle 内所有产品 T==1
-
-    输入 eval_df 是产品长表（每行一个 cust_id-date-product 记录），至少包含：
-    - cust_id, date, product_id, T, Y
-    若已有 cate（来自单产品推理）也会带上，后续可以用 synthesize_bundle_cate() 临时合成 bundle 的 cate。
-
-    输出：bundle_eval_df（长表），字段：
-    - cust_id, date, product_id=bundle_id, T (bundle), Y (按 cust_id-date 的 Y 聚合/一致性校验), cate(可选)
+    保留旧版 pandas 构造（仅用于小数据 debug）。
+    v3 大数据推荐使用 DuckDB 版本：build_bundle_eval_parquet_duckdb_debug()。
     """
-    validate_eval_df(eval_df)
-
     df = eval_df.copy()
     df["product_id"] = _as_str_product_id(df["product_id"])
 
@@ -274,33 +267,19 @@ def build_bundle_eval_df_and_mode(
     if sub.empty:
         return pd.DataFrame(columns=["cust_id", "product_id", "date", "cate", "T", "Y"])
 
-    # 以 cust_id-date 聚合，计算 AND
     gkey = ["cust_id", "date"]
-
-    # AND: all T==1
     t_and = sub.groupby(gkey, observed=False)["T"].min().rename("T_bundle").reset_index()
-
-    # Y: 你的定义是 t~t+30 存款差值，通常在同一 cust_id-date 下对所有产品行应一致。
-    # 这里取 mean 并做一个一致性检查（方差过大说明输入表需要清洗）
     y_agg = sub.groupby(gkey, observed=False)["Y"].mean().rename("Y").reset_index()
-    y_std = sub.groupby(gkey, observed=False)["Y"].std().rename("Y_std").reset_index()
 
-    out = t_and.merge(y_agg, on=gkey, how="left").merge(y_std, on=gkey, how="left")
+    out = t_and.merge(y_agg, on=gkey, how="left")
     out["product_id"] = bundle.bundle_id
     out.rename(columns={"T_bundle": "T"}, inplace=True)
-
-    # cate：默认不提供（应来自 bundle 模型推理）。若输入有单产品 cate，可后续用 synthesize_bundle_cate()
-    if "cate" in sub.columns:
-        out["cate"] = np.nan
-    else:
-        out["cate"] = np.nan
-
-    out = out[["cust_id", "product_id", "date", "cate", "T", "Y", "Y_std"]]
+    out["cate"] = np.nan
+    out = out[["cust_id", "product_id", "date", "cate", "T", "Y"]]
 
     if min_bundle_support_rows > 0:
         treated_n = int((out["T"] == 1).sum())
         if treated_n < min_bundle_support_rows:
-            # 返回空表示样本不足
             return pd.DataFrame(columns=out.columns)
 
     return out
@@ -358,6 +337,36 @@ def synthesize_bundle_cate(
 def _ensure_dir(path: str) -> None:
     import os
     os.makedirs(path, exist_ok=True)
+
+
+def _assert_bundle_out_dir_safe(path: str, *, arg_name: str) -> None:
+    """
+    防呆：禁止 bundle 输出写入单品 backtest 目录，避免覆盖/污染单品结果。
+
+    规则（简单强约束）：
+    - path 必须落在 backtest_output_bundle_v3 下（或其子路径）
+    - 且不能包含单品关键目录片段：backtest_output_v2/v3/backtest_output/eval_parquet
+
+    说明：
+    - Windows 下路径分隔符复杂，这里统一用 lower + replace("\\","/") 做判断。
+    """
+    p = (path or "").replace("\\", "/").lower()
+
+    # 强制要求：bundle 输出必须在 bundle 根目录下
+    if "backtest_output_bundle_v3" not in p:
+        raise ValueError(
+            f"[bundle-output-safety] {arg_name} must be under 'backtest_output_bundle_v3/'. "
+            f"Got: {path}"
+        )
+
+    # 注意：bundle 自己的目录名就叫 eval_parquet_bundle，所以这里不能用 "/eval_parquet" 做简单包含判断
+    forbidden = ["backtest_output_v2", "backtest_output_v3", "backtest_output/"]
+    hit = [x for x in forbidden if x in p]
+    if hit:
+        raise ValueError(
+            f"[bundle-output-safety] {arg_name} points to a single-product output directory (hits={hit}). "
+            f"Refuse to write. Got: {path}"
+        )
 
 
 def _bundle_artifact_paths(train_cfg: BundleTrainConfig, bundle_id: str) -> Dict[str, str]:
@@ -721,6 +730,286 @@ def compute_incremental_to_base(
 
 
 # =========================
+# v3（DuckDB）: 从单产品 parquet 生成 bundle parquet（debug：cate=min/mean/sum）
+# =========================
+
+def _duckdb_connect(db_path: Optional[str] = None):
+    import duckdb
+
+    con = duckdb.connect(database=(db_path or ":memory:"))
+    con.execute("PRAGMA threads=4;")
+    con.execute("PRAGMA enable_progress_bar=false;")
+    return con
+
+
+def _parquet_glob(parquet_dir: str) -> str:
+    from pathlib import Path
+
+    p = Path(parquet_dir).resolve().as_posix()
+    return f"{p}/**/*.parquet"
+
+
+def build_bundle_eval_parquet_duckdb_debug(
+    *,
+    single_parquet_dir: str,
+    out_bundle_parquet_dir: str,
+    bundle: BundleCandidate,
+    cate_mode: str = "min",
+    min_bundle_support_rows: int = 0,
+    duckdb_path: Optional[str] = None,
+) -> str:
+    """
+    直接在 DuckDB 里从单产品 eval parquet 生成该 bundle 的 eval parquet（hive 分区，product_id=bundle_id）。
+
+    输出 parquet schema（满足 v3 REQUIRED_COLUMNS）：
+    - cust_id, product_id(=bundle_id), date, cate, T, Y
+
+    debug cate 口径（只为跑通/研究，非生产）：
+    - min/mean/sum : 对 bundle 内单品 cate 聚合
+    """
+    import os
+    from pathlib import Path
+
+    os.makedirs(out_bundle_parquet_dir, exist_ok=True)
+    out_part_dir = os.path.join(out_bundle_parquet_dir, f"product_id={bundle.bundle_id}")
+    os.makedirs(out_part_dir, exist_ok=True)
+    out_path = os.path.join(out_part_dir, "part-00000.parquet")
+
+    prods = [str(p) for p in bundle.products]
+    prod_list_sql = ",".join([f"'{p}'" for p in prods])
+
+    if cate_mode == "min":
+        cate_expr = "MIN(cate)"
+    elif cate_mode == "mean":
+        cate_expr = "AVG(cate)"
+    elif cate_mode == "sum":
+        cate_expr = "SUM(cate)"
+    else:
+        raise ValueError(f"unknown cate_mode: {cate_mode}")
+
+    con = _duckdb_connect(duckdb_path)
+    glob = _parquet_glob(single_parquet_dir)
+
+    # 1) 聚合成 bundle 粒度（cust_id,date）
+    # 2) min_support：对 treated(T=1) 的样本量做门槛（用 HAVING）
+    sql = f"""
+    WITH sub AS (
+      SELECT
+        cust_id,
+        date,
+        MIN(T) AS T_bundle,
+        AVG(Y) AS Y_bundle,
+        {cate_expr} AS cate_bundle
+      FROM read_parquet('{glob}', hive_partitioning=1)
+      WHERE CAST(product_id AS VARCHAR) IN ({prod_list_sql})
+      GROUP BY cust_id, date
+    ),
+    filtered AS (
+      SELECT *
+      FROM sub
+      {"WHERE 1=1" if min_bundle_support_rows <= 0 else f"WHERE 1=1"}
+    )
+    SELECT
+      cust_id,
+      '{bundle.bundle_id}' AS product_id,
+      date,
+      cate_bundle AS cate,
+      T_bundle AS T,
+      Y_bundle AS Y
+    FROM filtered
+    """
+
+    # treated 支持度门槛：需要二次聚合得到 treated_n（避免全表回读）
+    if min_bundle_support_rows > 0:
+        sql = f"""
+        WITH sub AS (
+          SELECT
+            cust_id,
+            date,
+            MIN(T) AS T_bundle,
+            AVG(Y) AS Y_bundle,
+            {cate_expr} AS cate_bundle
+          FROM read_parquet('{glob}', hive_partitioning=1)
+          WHERE CAST(product_id AS VARCHAR) IN ({prod_list_sql})
+          GROUP BY cust_id, date
+        ),
+        stats AS (
+          SELECT SUM(CASE WHEN T_bundle=1 THEN 1 ELSE 0 END) AS treated_n
+          FROM sub
+        )
+        SELECT
+          s.cust_id,
+          '{bundle.bundle_id}' AS product_id,
+          s.date,
+          s.cate_bundle AS cate,
+          s.T_bundle AS T,
+          s.Y_bundle AS Y
+        FROM sub s
+        CROSS JOIN stats t
+        WHERE t.treated_n >= {int(min_bundle_support_rows)}
+        """
+
+    # 直接 COPY 到 hive 分区目录
+    out_path_posix = Path(out_path).resolve().as_posix()
+    con.execute(f"COPY ({sql}) TO '{out_path_posix}' (FORMAT PARQUET);")
+    con.close()
+
+    return out_path
+
+
+def run_bundle_mining_backtest_v3_debug(
+    *,
+    single_parquet_dir: str = "backtest_output_v2/eval_parquet",
+    out_root: str = "backtest_output_bundle_v3",
+    mining_cfg: Optional[BundleMiningConfig] = None,
+    product_cfg_for_bundle: Optional[ProductDecisionConfig] = None,
+    customer_cfg: Optional[CustomerDecisionConfig] = None,
+    safety_cfg: Optional[SafetyConfig] = None,
+    backtest_cfg: Optional[BacktestConfig] = None,
+    cate_mode: str = "min",
+    duckdb_path: Optional[str] = None,
+) -> Dict[str, object]:
+    """
+    v3 debug：从单产品 eval parquet 生成 bundle parquet（cate 合成），然后跑 run_backtest_v3 并输出 v3 报告。
+    """
+    import os
+
+    mining_cfg = mining_cfg or BundleMiningConfig()
+
+    _assert_bundle_out_dir_safe(out_root, arg_name="out_root")
+    os.makedirs(out_root, exist_ok=True)
+    bundle_parquet_dir = os.path.join(out_root, "eval_parquet_bundle")
+    _assert_bundle_out_dir_safe(bundle_parquet_dir, arg_name="bundle_parquet_dir")
+    os.makedirs(bundle_parquet_dir, exist_ok=True)
+
+    # 1) 单品评估（用于候选生成）
+    single_product_eval_df = evaluate_products_duckdb(
+        parquet_dir=single_parquet_dir,
+        product_config=ProductDecisionConfig(),
+        external_metrics_df=None,
+        duckdb_path=duckdb_path,
+    )
+
+    # 2) 候选
+    bundles = generate_bundle_candidates(single_product_eval_df, cfg=mining_cfg)
+    bundle_candidates_df = pd.DataFrame(
+        [
+            {
+                "bundle_id": b.bundle_id,
+                "products": ",".join(map(str, b.products)),
+                "base_product": b.base_product,
+                "boosters": ",".join(map(str, b.booster_products)) if b.booster_products else "",
+                "bundle_size": len(b.products),
+            }
+            for b in bundles
+        ]
+    )
+
+    kept: List[BundleCandidate] = []
+    for b in bundles:
+        build_bundle_eval_parquet_duckdb_debug(
+            single_parquet_dir=single_parquet_dir,
+            out_bundle_parquet_dir=bundle_parquet_dir,
+            bundle=b,
+            cate_mode=cate_mode,
+            min_bundle_support_rows=mining_cfg.min_bundle_support_rows,
+            duckdb_path=duckdb_path,
+        )
+        kept.append(b)
+
+    # 3) bundle 回测（v3）
+    bundle_result = run_backtest_v3(
+        parquet_dir=bundle_parquet_dir,
+        external_metrics_df=None,
+        product_config=product_cfg_for_bundle or ProductDecisionConfig(
+            min_support_samples=max(50, int(mining_cfg.min_bundle_support_rows)),
+            max_negative_uplift_ratio=0.55,
+            top_ratio=0.2,
+            enable_calibration=True,
+        ),
+        customer_config=customer_cfg or CustomerDecisionConfig(min_cate=0.0, top_k_per_customer=1),
+        safety_config=safety_cfg or SafetyConfig(min_customer_expected_gain=0.0),
+        backtest_config=backtest_cfg or BacktestConfig(),
+        duckdb_path=duckdb_path,
+    )
+
+    # 4) synergy/incremental（小表 pandas merge）
+    bundle_product_eval_df = bundle_result["product_eval_df"].copy()
+    bundle_product_eval_df["product_id"] = _as_str_product_id(bundle_product_eval_df["product_id"])
+
+    bundle_map: Dict[str, BundleCandidate] = {b.bundle_id: b for b in kept}
+
+    rows: List[Dict] = []
+    for _, r in bundle_product_eval_df.iterrows():
+        bid = str(r["product_id"])
+        b = bundle_map.get(bid)
+        if b is None:
+            continue
+        rows.append(
+            {
+                "bundle_id": bid,
+                "products": ",".join(map(str, b.products)),
+                "synergy_score": compute_synergy_score(r, product_eval_df=single_product_eval_df, bundle=b),
+                "incremental_to_base": compute_incremental_to_base(r, product_eval_df=single_product_eval_df, bundle=b),
+            }
+        )
+    bundle_metrics_df = pd.DataFrame(rows)
+    bundle_product_eval_df = bundle_product_eval_df.merge(
+        bundle_metrics_df, left_on="product_id", right_on="bundle_id", how="left"
+    ).drop(columns=["bundle_id"], errors="ignore")
+
+    # 5) 报告
+    bundle_result_with_metrics = dict(bundle_result)
+    bundle_result_with_metrics["product_eval_df"] = bundle_product_eval_df
+    report_path = os.path.join(out_root, "backtest_report_bundle_v3.md")
+    render_business_report_v3(bundle_result_with_metrics, out_path=report_path)
+
+    return {
+        "single_product_eval_df": single_product_eval_df,
+        "bundle_candidates_df": bundle_candidates_df,
+        "bundle_metrics_df": bundle_metrics_df,
+        "bundle_result": bundle_result_with_metrics,
+        "bundle_parquet_dir": bundle_parquet_dir,
+        "report_path": report_path,
+    }
+
+
+def run_bundle_mining_backtest_v3_prod(
+    *,
+    bundle_parquet_dir: str = "backtest_output_bundle_v3/eval_parquet_bundle",
+    out_root: str = "backtest_output_bundle_v3",
+    product_cfg_for_bundle: Optional[ProductDecisionConfig] = None,
+    customer_cfg: Optional[CustomerDecisionConfig] = None,
+    safety_cfg: Optional[SafetyConfig] = None,
+    backtest_cfg: Optional[BacktestConfig] = None,
+    duckdb_path: Optional[str] = None,
+) -> Dict[str, object]:
+    """
+    v3 prod：直接对“已经训练/推理好的 bundle eval parquet”做回测评估并输出报告。
+    """
+    import os
+
+    _assert_bundle_out_dir_safe(out_root, arg_name="out_root")
+    _assert_bundle_out_dir_safe(bundle_parquet_dir, arg_name="bundle_parquet_dir")
+
+    os.makedirs(out_root, exist_ok=True)
+    bundle_result = run_backtest_v3(
+        parquet_dir=bundle_parquet_dir,
+        external_metrics_df=None,
+        product_config=product_cfg_for_bundle or ProductDecisionConfig(),
+        customer_config=customer_cfg or CustomerDecisionConfig(),
+        safety_config=safety_cfg or SafetyConfig(),
+        backtest_config=backtest_cfg or BacktestConfig(),
+        duckdb_path=duckdb_path,
+    )
+
+    report_path = os.path.join(out_root, "backtest_report_bundle_v3.md")
+    render_business_report_v3(bundle_result, out_path=report_path)
+
+    return {"bundle_result": bundle_result, "bundle_parquet_dir": bundle_parquet_dir, "report_path": report_path}
+
+
+# =========================
 # 主流程：bundle mining（离线）
 # =========================
 
@@ -737,23 +1026,15 @@ def run_bundle_mining_backtest(
     synthesize_cate_mode: str = "min",
 ) -> Dict[str, pd.DataFrame]:
     """
-    Debug/研究入口：依赖 eval_df（长表），用于快速跑通组合评估/策略回测。
-
-    - debug：用单产品 cate 合成 bundle cate（min/mean/sum）
-    - prod ：仍然支持训练，但训练数据推荐从 per-product 文件读取（见 ensure_bundle_cate 的实现）
-
-    生产推荐使用 run_bundle_mining_prod_from_files()（不依赖 eval_df）。
-
-    输出：
-    - bundle_candidates_df
-    - bundle_product_eval_df（每个 bundle 的产品层评估结果）
-    - bundle_metrics_df（synergy/overlap/incremental）
-    - bundle_backtest_result（复用 run_backtest 的返回 dict）
-    - bundle_eval_all（拼接后的 bundle 长表）
+    旧版（pandas in-memory）debug/研究入口：用于小数据快速跑通逻辑。
+    大数据 v3 推荐使用：run_bundle_mining_backtest_v3_debug() / run_bundle_mining_backtest_v3_prod()。
     """
     mining_cfg = mining_cfg or BundleMiningConfig()
     train_cfg = train_cfg or BundleTrainConfig(mode="debug")
-    validate_eval_df(eval_df)
+    raise RuntimeError(
+        "run_bundle_mining_backtest() is pandas-based (small data) and is deprecated in v3 migration. "
+        "Use run_bundle_mining_backtest_v3_debug/prod."
+    )
 
     # 1) 候选
     bundles = generate_bundle_candidates(product_eval_df, cfg=mining_cfg)
@@ -824,20 +1105,9 @@ def run_bundle_mining_backtest(
 
     bundle_eval_all = pd.concat(bundle_eval_frames, axis=0, ignore_index=True)
 
-    # 3) 对所有 bundle 一次性跑 backtest（把 bundle 当 product_id）
-    bundle_result = run_backtest(
-        eval_df=bundle_eval_all.drop(columns=["Y_std"], errors="ignore"),
-        external_metrics_df=None,
-        product_config=product_cfg_for_bundle or ProductDecisionConfig(
-            # bundle 的样本更少，默认把支持门槛放低一点，避免全 reject
-            min_support_samples=max(50, int(mining_cfg.min_bundle_support_rows)),
-            max_negative_uplift_ratio=0.55,
-            top_ratio=0.2,
-            enable_calibration=True,
-        ),
-        customer_config=customer_cfg or CustomerDecisionConfig(min_cate=0.0, top_k_per_customer=1),
-        safety_config=safety_cfg or SafetyConfig(min_customer_expected_gain=0.0),
-        backtest_config=backtest_cfg or BacktestConfig(),
+    raise RuntimeError(
+        "run_bundle_mining_backtest() is pandas-based (small data). "
+        "For v3 large-scale evaluation use run_bundle_mining_backtest_v3_debug/prod."
     )
 
     bundle_product_eval_df = bundle_result["product_eval_df"].copy()
@@ -964,19 +1234,11 @@ def run_bundle_mining_prod_from_files(
 
     bundle_eval_all = pd.concat(bundle_eval_frames, axis=0, ignore_index=True)
 
-    # 复用回测
-    bundle_result = run_backtest(
-        eval_df=bundle_eval_all,
-        external_metrics_df=None,
-        product_config=product_cfg_for_bundle or ProductDecisionConfig(
-            min_support_samples=max(50, int(mining_cfg.min_bundle_support_rows)),
-            max_negative_uplift_ratio=0.55,
-            top_ratio=0.2,
-            enable_calibration=True,
-        ),
-        customer_config=customer_cfg or CustomerDecisionConfig(min_cate=0.0, top_k_per_customer=1),
-        safety_config=safety_cfg or SafetyConfig(min_customer_expected_gain=0.0),
-        backtest_config=backtest_cfg or BacktestConfig(),
+    # 复用回测（已迁移到 v3 的 parquet + duckdb 版本）
+    raise RuntimeError(
+        "run_bundle_mining_prod_from_files still uses legacy run_backtest(). "
+        "Please use the new v3 flow: (1) run bundle_cate_train_pipeline_v3.py to produce bundle parquet "
+        "(2) run run_bundle_mining_backtest_v3_prod(bundle_parquet_dir=...)."
     )
 
     bundle_product_eval_df = bundle_result["product_eval_df"].copy()
@@ -1016,26 +1278,10 @@ def run_bundle_mining_prod_from_files(
 
 
 if __name__ == "__main__":
-    # Demo：用 backtest_full_pipeline 的模拟数据做一次 bundle mining 演示
-    from backtest_full_pipeline import EvalDFSimConfig, simulate_evaldf, evaluate_products
-
-    sim_cfg = EvalDFSimConfig(
-        n_customers=30_000,
-        n_products=34,
-        n_dates=2,
-        use_category=True,
-        use_float32=True,
-        random_state=42,
-    )
-    eval_df = simulate_evaldf(sim_cfg)
-
-    # 先做单产品评估，得到 recommend_all / recommend_targeted
-    single_prod_eval = evaluate_products(eval_df)
-
-    # debug 模式：用单品 cate 合成 bundle cate（仅演示流程）
-    result = run_bundle_mining_backtest(
-        eval_df=eval_df,
-        product_eval_df=single_prod_eval,
+    # v3 Debug demo：从单产品 v3 eval parquet 生成 bundle parquet（cate=min 合成）并跑 v3 回测报告
+    result = run_bundle_mining_backtest_v3_debug(
+        single_parquet_dir="backtest_output_v2/eval_parquet",
+        out_root="backtest_output_bundle_v3",
         mining_cfg=BundleMiningConfig(
             and_mode=True,
             max_bundle_size=3,
@@ -1043,11 +1289,11 @@ if __name__ == "__main__":
             top_n_booster=6,
             min_bundle_support_rows=300,
         ),
-        train_cfg=BundleTrainConfig(mode="debug"),
-        synthesize_cate_mode="min",
+        cate_mode="min",
+        duckdb_path="backtest_output_bundle_v3/duckdb_tmp.db",
     )
 
     print("bundle_candidates:", result["bundle_candidates_df"].shape)
-    print("bundle_product_eval:", result["bundle_product_eval_df"].shape)
-    show_cols = [c for c in ["product_id", "recommendation_decision", "ate", "synergy_score", "overlap_ratio_top"] if c in result["bundle_product_eval_df"].columns]
-    print(result["bundle_product_eval_df"][show_cols].head(10))
+    print("bundle_metrics:", result["bundle_metrics_df"].shape)
+    print("bundle_parquet_dir:", result["bundle_parquet_dir"])
+    print("report_path:", result["report_path"])
