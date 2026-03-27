@@ -22,6 +22,7 @@ v3 目标（针对“真实数据没有 ps / mu0 / mu1”场景）：
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
+import urllib.parse
 
 import numpy as np
 import pandas as pd
@@ -654,6 +655,28 @@ def _parquet_glob(parquet_dir: str) -> str:
     return f"{p}/**/*.parquet"
 
 
+def _read_eval_preview_and_count(con, glob: str) -> Tuple[pd.DataFrame, int, str]:
+    diagnostics = []
+    sql_candidates = [
+        f"SELECT * FROM read_parquet('{glob}', hive_partitioning=1)",
+        f"SELECT * FROM read_parquet('{glob}')",
+        f"SELECT * FROM parquet_scan('{glob}', hive_partitioning=1)",
+        f"SELECT * FROM parquet_scan('{glob}')",
+    ]
+    for idx, sql in enumerate(sql_candidates, start=1):
+        try:
+            preview = con.execute(f"{sql} LIMIT 5").df()
+            count = int(con.execute(f"SELECT COUNT(*) FROM ({sql}) t").fetchone()[0])
+            return preview, count, f"candidate_{idx}: {sql}"
+        except Exception as exc:
+            diagnostics.append(f"candidate_{idx} failed: {exc}")
+    raise RuntimeError("Unable to read parquet with any supported duckdb scan mode. " + " | ".join(diagnostics))
+
+
+def _decode_product_id_series(series: pd.Series) -> pd.Series:
+    return series.astype(str).map(lambda x: urllib.parse.unquote(x) if isinstance(x, str) else x)
+
+
 def get_parquet_columns(parquet_dir: str, duckdb_path: Optional[str] = None) -> List[str]:
     con = _duckdb_connect(duckdb_path)
     glob = _parquet_glob(parquet_dir)
@@ -671,7 +694,13 @@ def evaluate_products_duckdb(
     product_config = product_config or ProductDecisionConfig()
     con = _duckdb_connect(duckdb_path)
     glob = _parquet_glob(parquet_dir)
+    eval_preview, eval_count, read_mode = _read_eval_preview_and_count(con, glob)
     con.execute(f"CREATE OR REPLACE VIEW eval AS SELECT * FROM read_parquet('{glob}', hive_partitioning=1);")
+    print(f"[backtest] evaluate_products_duckdb: parquet_dir={parquet_dir}, eval_count={eval_count}, eval_cols={list(eval_preview.columns)}, read_mode={read_mode}")
+    if eval_count == 0:
+        raise ValueError(
+            f"eval parquet is empty or unreadable: parquet_dir={parquet_dir!r}, glob={glob!r}, read_mode={read_mode!r}"
+        )
 
     base_sql = """
     SELECT
@@ -694,6 +723,7 @@ def evaluate_products_duckdb(
     GROUP BY product_id
     """
     base = con.execute(base_sql).df()
+    base["product_id"] = _decode_product_id_series(base["product_id"])
     base["empirical_uplift"] = base["treated_mean_outcome"] - base["control_mean_outcome"]
 
     top_ratio = float(product_config.top_ratio)
@@ -760,6 +790,8 @@ def evaluate_products_duckdb(
     GROUP BY product_id
     """
     qini_df = con.execute(qini_sql).df()
+    qini_df["product_id"] = _decode_product_id_series(qini_df["product_id"])
+    top_df["product_id"] = _decode_product_id_series(top_df["product_id"])
 
     product_eval = base.merge(top_df, on="product_id", how="left").merge(qini_df, on="product_id", how="left")
 
@@ -841,6 +873,12 @@ def generate_recommendations_duckdb(
     safety_config = safety_config or SafetyConfig()
     product_config = product_config or ProductDecisionConfig()
 
+    if product_eval_df is None or product_eval_df.empty:
+        raise ValueError(
+            f"product_eval_df is empty, cannot generate recommendations. "
+            f"Check evaluate_products_duckdb(parquet_dir={parquet_dir!r}) and parquet contents."
+        )
+
     con = _duckdb_connect(duckdb_path)
     glob = _parquet_glob(parquet_dir)
     con.execute(f"CREATE OR REPLACE VIEW eval AS SELECT * FROM read_parquet('{glob}', hive_partitioning=1);")
@@ -849,6 +887,10 @@ def generate_recommendations_duckdb(
     has_ps = "ps" in cols
     has_mu0 = "mu0" in cols
     has_mu1 = "mu1" in cols
+
+    product_eval_df = product_eval_df.copy()
+    if "product_id" in product_eval_df.columns:
+        product_eval_df["product_id"] = _decode_product_id_series(product_eval_df["product_id"])
 
     ps_expr = "e.ps" if has_ps else "CAST(NULL AS DOUBLE) AS ps"
     mu0_expr = "e.mu0" if has_mu0 else "CAST(NULL AS DOUBLE) AS mu0"
@@ -1168,6 +1210,11 @@ def run_backtest_v3(
         external_metrics_df=external_metrics_df,
         duckdb_path=duckdb_path,
     )
+    if product_eval_df is None or product_eval_df.empty:
+        raise ValueError(
+            f"evaluate_products_duckdb returned empty product_eval_df. "
+            f"Please check parquet_dir={parquet_dir!r} and parquet schema/contents."
+        )
 
     single_day_result: Dict[str, pd.DataFrame] = {}
     run_full = mode in {"full", "both"}
@@ -1227,25 +1274,29 @@ def run_backtest_v3(
                     ]
                 )
 
-            eligible_customer_reco_df = generate_recommendations_duckdb(
-                parquet_dir=parquet_dir,
-                product_eval_df=eligible_product_eval_df,
-                customer_config=customer_config,
-                safety_config=safety_config,
-                product_config=product_config,
-                duckdb_path=duckdb_path,
-            )
-            eligible_policy_gain_df = (
-                policy_gain_curve_duckdb(
-                    reco_df=eligible_customer_reco_df,
-                    score_col="recommend_score" if "recommend_score" in eligible_customer_reco_df.columns else "adjusted_cate",
-                    bins=backtest_config.policy_bins,
-                    baseline_mode="global_mean",
+            if eligible_product_eval_df.empty:
+                eligible_customer_reco_df = pd.DataFrame()
+                eligible_policy_gain_df = pd.DataFrame(columns=["top_pct", "n", "uplift_gain"])
+            else:
+                eligible_customer_reco_df = generate_recommendations_duckdb(
+                    parquet_dir=parquet_dir,
+                    product_eval_df=eligible_product_eval_df,
+                    customer_config=customer_config,
+                    safety_config=safety_config,
+                    product_config=product_config,
                     duckdb_path=duckdb_path,
                 )
-                if not eligible_customer_reco_df.empty
-                else pd.DataFrame(columns=["top_pct", "n", "uplift_gain"])
-            )
+                eligible_policy_gain_df = (
+                    policy_gain_curve_duckdb(
+                        reco_df=eligible_customer_reco_df,
+                        score_col="recommend_score" if "recommend_score" in eligible_customer_reco_df.columns else "adjusted_cate",
+                        bins=backtest_config.policy_bins,
+                        baseline_mode="global_mean",
+                        duckdb_path=duckdb_path,
+                    )
+                    if not eligible_customer_reco_df.empty
+                    else pd.DataFrame(columns=["top_pct", "n", "uplift_gain"])
+                )
             single_day_result = {
                 "eligible_eval_df": eligible_eval_df,
                 "eligible_product_eval_df": eligible_product_eval_df,
@@ -1339,7 +1390,7 @@ def main() -> None:
     # - --run_tests 不是单元测试，而是按顺序执行多个可执行场景，便于一键回归。
     parser = argparse.ArgumentParser(description="Backtest full pipeline v3")
     parser.add_argument("--mode", choices=["full", "single_day", "both"], default="both")
-    parser.add_argument("--parquet_dir", default="output/backtest_output_v2/eval_parquet")
+    parser.add_argument("--parquet_dir", default="output/backtest_output_v3/eval_parquet")
     parser.add_argument("--out_dir", default="output/backtest_output_v3")
     parser.add_argument("--as_of_date", default=None)
     parser.add_argument("--lookback_days", type=int, default=30)
@@ -1469,6 +1520,65 @@ def main() -> None:
 
     _save_result(result, out_root)
 
+
+
+
+# =============================================================================
+# 命令行参数说明（CLI Reference）
+# =============================================================================
+# 运行方式：
+#   python src/backtest_full_pipeline_v3.py --mode full --parquet_dir output/backtest_output_v3/eval_parquet --out_dir output/backtest_output_v3_test/run1
+#
+# 参数说明：
+#   --mode
+#     可选值：full / single_day / both
+#     * full       ：仅执行全量回测，生成产品层、客户层、策略层输出
+#     * single_day ：仅执行单日可推荐子集链路，适合检查某个 as_of_date 的线上投放口径
+#     * both       ：同时执行 full + single_day
+#
+#   --parquet_dir
+#     输入评估数据目录，目录下应包含按 product_id 分区的 parquet 文件，例如：
+#       output/backtest_output_v3/eval_parquet/
+#
+#   --out_dir
+#     输出目录，脚本会在该目录下写入：
+#       - product_eval_df.csv
+#       - customer_reco_df.csv
+#       - reco_empirical_eval_df.csv
+#       - policy_gain_df.csv
+#       - temporal_df.csv
+#       - temporal_reco_df.csv
+#       - ope_df.csv
+#       - backtest_report_v3.md
+#
+#   --as_of_date
+#     单日子集模式下使用的目标日期，格式示例：2026-01-20
+#     若不传且启用 single_day，会自动取 parquet 中的最新 date。
+#
+#   --lookback_days
+#     单日子集回看天数，默认 30。
+#     规则：在 [as_of_date - lookback_days, as_of_date - 1] 内出现过 T=1 的 cust_id+product_id
+#     会被视为不可推荐。
+#
+#   --enable_single_day_reco
+#     仅显式开启单日子集链路时使用。
+#     若 mode 为 single_day 或 both，则通常无需额外传这个参数。
+#
+#   --run_tests
+#     一键跑多个回归场景：single_day / full / both。
+#
+# 常见命令示例：
+#   1) 全量回测：
+#      python src/backtest_full_pipeline_v3.py --mode full --parquet_dir output/backtest_output_v3/eval_parquet --out_dir output/backtest_output_v3_test/full_run
+#
+#   2) 单日可推荐子集：
+#      python src/backtest_full_pipeline_v3.py --mode single_day --parquet_dir output/backtest_output_v3/eval_parquet --out_dir output/backtest_output_v3_test/single_day_run --as_of_date 2026-01-20 --lookback_days 30
+#
+#   3) 同时跑全量 + 单日：
+#      python src/backtest_full_pipeline_v3.py --mode both --parquet_dir output/backtest_output_v3/eval_parquet --out_dir output/backtest_output_v3_test/both_run --as_of_date 2026-01-20 --lookback_days 30
+#
+#   4) 回归测试：
+#      python src/backtest_full_pipeline_v3.py --run_tests --parquet_dir output/backtest_output_v3/eval_parquet --out_dir output/backtest_output_v3_test/regression
 
 if __name__ == "__main__":
     main()

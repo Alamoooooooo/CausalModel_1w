@@ -2,13 +2,13 @@ from __future__ import annotations
 
 """
 bundle_cate_train_pipeline_v3.py
-================================================
+
 目标：为 bundle（产品组合）独立训练 CATE 模型，并产出符合 backtest_full_pipeline_v3 的 eval parquet。
 
 输入（生产形态）：
 - per_product_data_dir 下每个产品一个文件（parquet/csv），粒度为 (cust_id, date)
 - 列至少包含：cust_id, date, X..., T, Y
-- 假设：不同产品文件中的 X 是同一套客户画像特征（你的确认）
+- product_id 可以是中文字符串，文件名/目录名会直接使用原始字符串，DuckDB/Parquet 兼容中文路径。
 
 输出：
 - bundle_parquet_dir（hive partition）：{out_dir}/product_id={bundle_id}/part-*.parquet
@@ -20,13 +20,13 @@ bundle_cate_train_pipeline_v3.py
   - E 级数据必须“抽样/分期/分桶”训练，这里提供 sample/日期窗口参数
 - 该脚本只负责“训练+产出 bundle eval parquet”，评估/报告请用 bundle_mining_pipeline.py 的 v3 prod 入口：
   run_bundle_mining_backtest_v3_prod(bundle_parquet_dir=...)
-
 """
 
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
+import argparse
 import numpy as np
 import pandas as pd
 
@@ -69,7 +69,7 @@ class BundleTrainJobConfig:
     feature_cols: Optional[List[str]] = None
 
     # 输出 bundle eval parquet（hive partition）
-    out_bundle_parquet_dir: str = "backtest_output_bundle_v3/eval_parquet_bundle"
+    out_bundle_parquet_dir: str = "output/backtest_output_v3/eval_parquet_bundle"
 
     # DRLearner 模型与 cate 缓存目录（可选）
     artifacts_dir: str = "bundle_artifacts_v3"
@@ -109,17 +109,18 @@ def _ensure_dir(p: str) -> None:
 def _assert_bundle_out_dir_safe(path: str, *, arg_name: str) -> None:
     """
     防呆：禁止 bundle 训练/落盘写入单品 backtest 输出目录，避免覆盖/污染单品结果。
-    固定约束：bundle 产物必须落在 backtest_output_bundle_v3/ 下。
+    固定约束：bundle 产物必须落在 output/backtest_output_v3/ 或 backtest_output_bundle_v3/ 下。
 
-    - 允许：backtest_output_bundle_v3 及其子目录
-    - 禁止：backtest_output_v2 / backtest_output_v3 / backtest_output/
+    - 允许：output/backtest_output_v3、backtest_output_bundle_v3 及其子目录
+    - 禁止：backtest_output_v2 / backtest_output/
     """
     p = (path or "").replace("\\", "/").lower()
-    if "backtest_output_bundle_v3" not in p:
+    allowed = ("output/backtest_output_v3", "backtest_output_bundle_v3")
+    if not any(token in p for token in allowed):
         raise ValueError(
-            f"[bundle-output-safety] {arg_name} must be under 'backtest_output_bundle_v3/'. Got: {path}"
+            f"[bundle-output-safety] {arg_name} must be under 'output/backtest_output_v3/' or 'backtest_output_bundle_v3/'. Got: {path}"
         )
-    forbidden = ["backtest_output_v2", "backtest_output_v3", "backtest_output/"]
+    forbidden = ["backtest_output_v2", "backtest_output/"]
     hit = [x for x in forbidden if x in p]
     if hit:
         raise ValueError(
@@ -129,10 +130,56 @@ def _assert_bundle_out_dir_safe(path: str, *, arg_name: str) -> None:
 
 
 def _bundle_id_from_products(products: Sequence[str]) -> str:
-    ps = tuple(sorted(map(str, products)))
+    ps = tuple(sorted(str(p).strip() for p in products))
     if len(ps) == 2:
         return f"bundle_and__{ps[0]}__{ps[1]}"
     return "bundle_and__" + "__".join(ps)
+
+
+def _default_demo_cfg() -> BundleTrainJobConfig:
+    return BundleTrainJobConfig(
+        per_product_data_dir="output/backtest_output_v3/eval_parquet",
+        per_product_file_pattern="product_id={product_id}/part-*.parquet",
+        per_product_file_format="parquet",
+        feature_cols=None,
+        out_bundle_parquet_dir="output/backtest_output_v3/eval_parquet_bundle",
+        sample_limit=200_000,
+    )
+
+
+def _print_demo_usage() -> None:
+    print("示例命令：python src/bundle_cate_train_pipeline_v3.py")
+    print("示例命令：python src/bundle_cate_train_pipeline_v3.py --demo")
+    print("示例命令：python src/bundle_cate_train_pipeline_v3.py --bundle_products 活动A 活动B --base_product 活动A --feature_cols x1 x2 x3")
+    print("示例命令：python src/bundle_cate_train_pipeline_v3.py --bundle_products 活动A 活动B --base_product 活动A --per_product_data_dir output/backtest_output_v3/eval_parquet --out_bundle_parquet_dir output/backtest_output_v3/eval_parquet_bundle")
+    print("中文 product_id 示例：活动A、活动B、会员权益包、优惠券包")
+
+
+def _run_demo() -> None:
+    cfg = _default_demo_cfg()
+    _assert_bundle_out_dir_safe(cfg.out_bundle_parquet_dir, arg_name="cfg.out_bundle_parquet_dir")
+
+    print("bundle_cate_train_pipeline_v3 demo 已启动。")
+    print(f"输入目录: {cfg.per_product_data_dir}")
+    print(f"输出目录: {cfg.out_bundle_parquet_dir}")
+    print("请先确认 per_product_data_dir 下存在按 product_id 分区的 parquet 文件。")
+    print("例如：output/backtest_output_v3/eval_parquet/product_id=活动A/part-00000.parquet")
+
+    demo_bundle_products = ["活动A", "活动B"]
+    demo_base_product = "活动A"
+
+    try:
+        out_path = train_one_bundle_and_write_eval(
+            bundle_products=demo_bundle_products,
+            base_product=demo_base_product,
+            cfg=cfg,
+            duckdb_path="bundle_train_tmp.duckdb",
+        )
+        print(f"已写出 bundle eval parquet: {out_path}")
+    except Exception as exc:
+        print(f"demo 执行失败（通常是因为本地没有对应输入数据或缺少 feature_cols）：{exc}")
+        print("如需正式运行，请设置 cfg.feature_cols，并确保输入 parquet 已存在。")
+        _print_demo_usage()
 
 
 # -------------------------
@@ -222,7 +269,7 @@ def build_bundle_train_df_duckdb(
     t_cols = [f"T__{str(pid)}" for pid in [base_pid] + [str(p) for p in bundle_products if str(p) != base_pid]]
     y_cols = [f"Y__{str(pid)}" for pid in [base_pid] + [str(p) for p in bundle_products if str(p) != base_pid]]
 
-    t_expr = "LEAST(" + ", ".join(t_cols) + ")"  # MIN across cols
+    t_expr = "LEAST(" + ", ".join(t_cols) + ")"
     y_expr = "(" + " + ".join(y_cols) + ") / " + str(len(y_cols))
 
     final_sql = f"""
@@ -240,18 +287,14 @@ def build_bundle_train_df_duckdb(
     if cfg.sample_limit is not None:
         final_sql += f"\nLIMIT {int(cfg.sample_limit)}"
     elif cfg.sample_frac is not None:
-        # DuckDB 的 USING SAMPLE 支持 SYSTEM/BERNOULLI，这里用 BERNOULLI
         final_sql = f"SELECT * FROM ({final_sql}) USING SAMPLE BERNOULLI({float(cfg.sample_frac) * 100.0});"
-    # 额外防呆：不允许把单品 eval parquet 目录误用于 bundle 输出
+
     _assert_bundle_out_dir_safe(cfg.out_bundle_parquet_dir, arg_name="cfg.out_bundle_parquet_dir")
-    # 保持与 bundle_mining_pipeline_v3 一致：bundle 输出目录必须是 bundle 根目录或其子目录
 
     df = con.execute(final_sql).df()
     con.close()
 
-    # 简单缺失处理（保持与 bundle_mining_pipeline.py 一致）
     df[cfg.feature_cols] = df[cfg.feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
-
     return df
 
 
@@ -268,7 +311,6 @@ def train_and_predict_drlearner(
         raise ImportError("This script requires causalml. Please install causalml to run bundle training.")
 
     from sklearn.ensemble import RandomForestRegressor
-    from joblib import dump
 
     params = cfg.learner_params or {}
     base_learner = params.get(
@@ -289,7 +331,6 @@ def train_and_predict_drlearner(
     learner = BaseDRLearner(learner=base_learner)
     learner.fit(X=X, treatment=T, y=y)
     cate = np.asarray(learner.predict(X=X)).reshape(-1)
-
     return cate
 
 
@@ -315,8 +356,6 @@ def write_bundle_eval_parquet(
     out = train_df[["cust_id", "date", "T", "Y"]].copy()
     out["product_id"] = bundle_id
     out["cate"] = cate.astype(np.float32)
-
-    # 列顺序对齐 v3 REQUIRED_COLUMNS：cust_id, product_id, date, cate, T, Y
     out = out[["cust_id", "product_id", "date", "cate", "T", "Y"]]
 
     path = out_dir / "part-00000.parquet"
@@ -353,18 +392,16 @@ def train_one_bundle_and_write_eval(
 
 
 if __name__ == "__main__":
-    # 该 demo 仅展示脚手架如何跑通，不会自动生成 bundle 候选。
-    # 生产建议：先用 bundle_mining_pipeline.py 生成 bundle_candidates_df，再在这里循环训练。
+    # 运行方式示例：
+    # 中文单 bundle 示例（请替换成真实 product_id）：
+    #   python src/bundle_cate_train_pipeline_v3.py --demo
+    #   python src/bundle_cate_train_pipeline_v3.py --bundle_products 活动A 活动B --base_product 活动A --feature_cols x1 x2 x3
+    #   python src/bundle_cate_train_pipeline_v3.py --bundle_products 会员权益包 优惠券包 --base_product 会员权益包 --per_product_data_dir output/backtest_output_v3/eval_parquet --out_bundle_parquet_dir output/backtest_output_v3/eval_parquet_bundle
+    #
+    # 说明：
+    # - demo 默认读取 output/backtest_output_v3/eval_parquet 下的单品评估 parquet
+    # - demo 默认写入 output/backtest_output_v3/eval_parquet_bundle
+    # - 若本地没有输入数据，脚本会给出提示，不会破坏已有逻辑
 
-    cfg = BundleTrainJobConfig(
-        per_product_data_dir="per_product_data",
-        per_product_file_pattern="{product_id}.parquet",
-        per_product_file_format="parquet",
-        feature_cols=None,  # 你需要填你的 X 列名列表
-        out_bundle_parquet_dir="backtest_output_bundle_v3/eval_parquet_bundle",
-        sample_limit=2_000_000,
-    )
-
-    # 示例：训练一个 2-product bundle（请替换成真实 product_id）
-    # train_one_bundle_and_write_eval(bundle_products=["1", "2"], base_product="1", cfg=cfg, duckdb_path="bundle_train_tmp.duckdb")
-    print("bundle_cate_train_pipeline_v3.py scaffold ready. Please set cfg.feature_cols and call train_one_bundle_and_write_eval().")
+    _print_demo_usage()
+    _run_demo()
